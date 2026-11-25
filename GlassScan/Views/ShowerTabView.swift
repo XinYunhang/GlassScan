@@ -6,6 +6,7 @@ struct ShowerTabView: View {
     @Environment(ShowerController.self) private var shower
     @State private var searchText = ""
     @State private var onlyFavorites = false
+    @State private var onlyIdle = false
     @State private var confirmStartDevice: QiekjDevice?
     @State private var showStopConfirm = false
     @State private var showForceDismissConfirm = false
@@ -14,17 +15,47 @@ struct ShowerTabView: View {
 
     @Namespace private var glassNS
 
+    /// Devices matching the current building + floor selection (before idle/fav/search filters)
+    private var floorScopedDevices: [QiekjDevice] {
+        let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // When user explicitly types a search query, search across ALL buildings/floors
+        if !q.isEmpty {
+            return shower.sortedDevices.filter { device in
+                device.goodsName.lowercased().contains(q)
+                    || device.floorLabel.lowercased().contains(q)
+                    || device.parentPointName.lowercased().contains(q)
+                    || device.goodsId.contains(q)
+            }
+        }
+        return shower.sortedDevices.filter { device in
+            if let b = shower.selectedBuilding, device.buildingKey != b {
+                return false
+            }
+            if let f = shower.selectedFloor, device.floorNumber != f {
+                return false
+            }
+            return true
+        }
+    }
+
     private var filteredDevices: [QiekjDevice] {
-        shower.sortedDevices.filter { device in
+        floorScopedDevices.filter { device in
             if onlyFavorites && !shower.favoriteGoodsIDs.contains(device.goodsId) {
                 return false
             }
-            let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard !q.isEmpty else { return true }
-            return device.goodsName.lowercased().contains(q)
-                || device.parentPointName.lowercased().contains(q)
-                || device.goodsId.contains(q)
+            if onlyIdle && !device.isIdle {
+                return false
+            }
+            return true
         }
+    }
+
+    private var idleCountOnFloor: Int {
+        floorScopedDevices.filter(\.isIdle).count
+    }
+
+    private var busyCountOnFloor: Int {
+        floorScopedDevices.filter(\.isBusy).count
     }
 
     private var isBusySession: Bool {
@@ -61,6 +92,9 @@ struct ShowerTabView: View {
 
                                 accountMetricsBar(usePoints: $bindableShower.usePoints)
                                 activeSessionSection
+                                if !shower.devices.isEmpty {
+                                    floorSelectorCard
+                                }
                                 stallsSection
                                 if !shower.recentOrders.isEmpty {
                                     recentBillsSection
@@ -91,7 +125,7 @@ struct ShowerTabView: View {
                 }
             }
             .navigationTitle("胖乖洗澡")
-            .searchable(text: $searchText, prompt: "搜索隔间号（如 90404）")
+            .searchable(text: $searchText, prompt: "全局搜索隔间号（如 90403）")
             .toolbar {
                 if shower.isLoggedIn {
                     ToolbarItem(placement: .topBarTrailing) {
@@ -134,7 +168,8 @@ struct ShowerTabView: View {
                     shower.startShower(device: device)
                 }
             } message: { device in
-                Text("将通过胖乖云端开启「\(device.goodsName)」出水（先用后付按流量计费），确认你已站在该隔间内。")
+                let warn = device.isBusy ? "\n⚠️ 该隔间当前显示「使用中」，请核实后再操作！" : ""
+                Text("将通过胖乖云端开启「\(device.floorLabel) · \(device.shortStallTitle)」（\(device.goodsName)）出水（先用后付按流量计费）。\(warn)")
             }
             .alert("确认结束本次洗澡？", isPresented: $showStopConfirm) {
                 Button("继续洗", role: .cancel) {}
@@ -165,6 +200,105 @@ struct ShowerTabView: View {
         }
     }
 
+    // MARK: - Building & Floor Selector Card
+
+    private var floorSelectorCard: some View {
+        let buildings = shower.availableBuildings
+        let floors = shower.availableFloors(for: shower.selectedBuilding)
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Menu {
+                    Button {
+                        withAnimation { shower.selectBuilding(nil) }
+                    } label: {
+                        Label("全部楼栋", systemImage: shower.selectedBuilding == nil ? "checkmark" : "building.2")
+                    }
+                    Divider()
+                    ForEach(buildings, id: \.self) { b in
+                        Button {
+                            withAnimation { shower.selectBuilding(b) }
+                        } label: {
+                            Label(b, systemImage: shower.selectedBuilding == b ? "checkmark" : "building")
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "building.2.fill")
+                            .font(.caption.weight(.semibold))
+                        Text(shower.selectedBuilding ?? "全部楼栋")
+                            .font(.subheadline.weight(.bold))
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
+
+                Spacer()
+
+                // Live free/busy counter for current floor
+                HStack(spacing: 8) {
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.green).frame(width: 7, height: 7)
+                        Text("空闲 \(idleCountOnFloor)")
+                            .font(.caption.monospacedDigit().weight(.bold))
+                            .foregroundStyle(.green)
+                    }
+                    if busyCountOnFloor > 0 {
+                        HStack(spacing: 4) {
+                            Circle().fill(Color.orange).frame(width: 7, height: 7)
+                            Text("使用中 \(busyCountOnFloor)")
+                                .font(.caption.monospacedDigit().weight(.bold))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.primary.opacity(0.05), in: Capsule())
+            }
+
+            if !floors.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    GlassEffectContainer(spacing: 8) {
+                        HStack(spacing: 8) {
+                            floorPill(title: "全部楼层", selected: shower.selectedFloor == nil) {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    shower.selectFloor(nil)
+                                }
+                            }
+                            ForEach(floors, id: \.self) { floor in
+                                floorPill(title: "\(floor)层", selected: shower.selectedFloor == floor) {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                        shower.selectFloor(floor)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .glassEffect(.regular, in: .rect(cornerRadius: 24))
+    }
+
+    private func floorPill(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .buttonStyle(.plain)
+            .glassEffect(
+                selected ? .regular.tint(.cyan).interactive() : .regular.interactive(),
+                in: .capsule
+            )
+    }
+
     // MARK: - Highlighted Scanned Stall Spotlight
 
     private func highlightedScannedCard(device: QiekjDevice) -> some View {
@@ -191,25 +325,14 @@ struct ShowerTabView: View {
             }
 
             HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text("隔间 \(device.goodsName)")
-                    .font(.system(size: 32, weight: .bold, design: .rounded).monospacedDigit())
+                Text("\(device.floorLabel) · \(device.shortStallTitle)")
+                    .font(.system(size: 26, weight: .bold, design: .rounded))
 
-                Text(device.statusLabel)
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(
-                        (device.isIdle ? Color.green : Color.orange).opacity(0.22),
-                        in: Capsule()
-                    )
-                    .foregroundStyle(device.isIdle ? .green : .orange)
+                statusBadge(for: device)
             }
 
-            let locationText = [device.parentPointName, device.orgName, "goodsId: \(device.goodsId)"]
-                .filter { !$0.isEmpty }
-                .joined(separator: " · ")
-            Text(locationText)
-                .font(.caption)
+            Text("编号 \(device.goodsName) · goodsId: \(device.goodsId)")
+                .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
 
             Button {
@@ -264,7 +387,7 @@ struct ShowerTabView: View {
                 .foregroundStyle(.cyan)
             Text("登录胖乖生活以启用一键洗澡")
                 .font(.headline)
-            Text("登录后自动拉取本校所有淋浴隔间与常用隔间，支持一键云端开阀与远程停阀结算。")
+            Text("登录后自动拉取本校所有淋浴隔间并按楼栋/楼层分组，实时查看空闲与使用中状态。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -325,18 +448,16 @@ struct ShowerTabView: View {
             EmptyView()
 
         case let .preparing(device, step):
-            VStack(spacing: 12) {
-                HStack(spacing: 12) {
-                    ProgressView()
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("正在启动 · 隔间 \(device.goodsName)")
-                            .font(.headline)
-                        Text(step)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
+            HStack(spacing: 12) {
+                ProgressView()
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("正在启动 · \(device.floorLabel) \(device.shortStallTitle)")
+                        .font(.headline)
+                    Text(step)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 }
+                Spacer()
             }
             .padding(18)
             .glassEffect(.regular.tint(.cyan), in: .rect(cornerRadius: 26))
@@ -346,7 +467,7 @@ struct ShowerTabView: View {
                 let elapsed = max(0, Int(context.date.timeIntervalSince(startedAt)))
                 VStack(spacing: 14) {
                     HStack {
-                        Label("隔间 \(device.goodsName) · 出水中", systemImage: "drop.fill")
+                        Label("\(device.shortStallTitle) (\(device.goodsName)) · 出水中", systemImage: "drop.fill")
                             .font(.headline)
                         Spacer()
                         Text(appEndSupported ? "支持远程停阀" : "设备端停水")
@@ -415,7 +536,7 @@ struct ShowerTabView: View {
             HStack(spacing: 12) {
                 ProgressView()
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("结算中 · 隔间 \(device.goodsName)")
+                    Text("结算中 · \(device.shortStallTitle) (\(device.goodsName))")
                         .font(.headline)
                     Text(step)
                         .font(.subheadline)
@@ -469,19 +590,43 @@ struct ShowerTabView: View {
     }
 
     private var stallsSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let titlePrefix: String = {
+            if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "搜索结果"
+            }
+            var parts: [String] = []
+            if let b = shower.selectedBuilding { parts.append(b) }
+            if let f = shower.selectedFloor { parts.append("\(f)层") }
+            return parts.isEmpty ? "全部隔间" : parts.joined(separator: " · ")
+        }()
+
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("淋浴隔间 (\(filteredDevices.count))")
+                Text("\(titlePrefix) (\(filteredDevices.count))")
                     .font(.headline)
                 Spacer()
                 GlassEffectContainer(spacing: 8) {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 6) {
+                        Button {
+                            withAnimation { onlyIdle.toggle() }
+                        } label: {
+                            Label("仅空闲", systemImage: onlyIdle ? "checkmark.circle.fill" : "circle")
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(
+                            onlyIdle ? .regular.tint(.green).interactive() : .regular.interactive(),
+                            in: .capsule
+                        )
+
                         Button {
                             withAnimation { onlyFavorites.toggle() }
                         } label: {
-                            Label(onlyFavorites ? "全部" : "收藏", systemImage: onlyFavorites ? "star.fill" : "star")
+                            Image(systemName: onlyFavorites ? "star.fill" : "star")
                                 .font(.caption.weight(.semibold))
-                                .padding(.horizontal, 10)
+                                .padding(.horizontal, 9)
                                 .padding(.vertical, 6)
                         }
                         .buttonStyle(.plain)
@@ -493,9 +638,9 @@ struct ShowerTabView: View {
                         Button {
                             selectedTab = .scan
                         } label: {
-                            Label("扫码定位", systemImage: "qrcode.viewfinder")
+                            Image(systemName: "qrcode.viewfinder")
                                 .font(.caption.weight(.semibold))
-                                .padding(.horizontal, 10)
+                                .padding(.horizontal, 9)
                                 .padding(.vertical, 6)
                         }
                         .buttonStyle(.plain)
@@ -506,21 +651,30 @@ struct ShowerTabView: View {
 
             if filteredDevices.isEmpty {
                 VStack(spacing: 10) {
-                    Text(shower.isRefreshing ? "正在拉取隔间列表…" : "暂无匹配的淋浴隔间")
+                    Text(shower.isRefreshing ? "正在拉取隔间状态…" : "当前筛选下暂无隔间")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    Button("刷新隔间列表") {
-                        Task { await shower.refreshAll() }
+                    HStack(spacing: 10) {
+                        if onlyIdle || onlyFavorites {
+                            Button("清除筛选") {
+                                onlyIdle = false
+                                onlyFavorites = false
+                            }
+                            .buttonStyle(.glass)
+                        }
+                        Button("刷新隔间") {
+                            Task { await shower.refreshAll() }
+                        }
+                        .buttonStyle(.glass)
                     }
-                    .buttonStyle(.glass)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(22)
                 .glassEffect(.regular, in: .rect(cornerRadius: 24))
             } else {
-                LazyVStack(spacing: 10) {
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                     ForEach(filteredDevices) { device in
-                        stallRow(device: device)
+                        stallGridCard(device: device)
                             .id(device.goodsId)
                     }
                 }
@@ -528,73 +682,105 @@ struct ShowerTabView: View {
         }
     }
 
-    private func stallRow(device: QiekjDevice) -> some View {
+    private func stallGridCard(device: QiekjDevice) -> some View {
         let isFav = shower.favoriteGoodsIDs.contains(device.goodsId)
         let isHighlighted = shower.highlightedDevice?.goodsId == device.goodsId
 
-        return HStack(spacing: 12) {
-            Button {
-                shower.toggleFavorite(goodsId: device.goodsId)
-            } label: {
-                Image(systemName: isFav ? "star.fill" : "star")
-                    .foregroundStyle(isFav ? .yellow : .secondary)
-                    .font(.body)
-                    .frame(width: 34, height: 34)
-            }
-            .buttonStyle(.plain)
-            .glassEffect(.regular.interactive(), in: .circle)
-
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(device.shortStallTitle)
+                        .font(.title3.weight(.bold))
+                        .lineLimit(1)
                     Text(device.goodsName)
-                        .font(.title3.monospacedDigit().weight(.bold))
-                    Text(device.statusLabel)
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(
-                            (device.isIdle ? Color.green : Color.orange).opacity(0.18),
-                            in: Capsule()
-                        )
-                        .foregroundStyle(device.isIdle ? .green : .orange)
-                    if isHighlighted {
-                        Text("当前扫码")
-                            .font(.caption2.weight(.bold))
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 3)
-                            .background(Color.cyan.opacity(0.25), in: Capsule())
-                            .foregroundStyle(.cyan)
-                    }
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
                 }
-
-                let subtitle = [device.parentPointName, device.orgName]
-                    .filter { !$0.isEmpty }
-                    .joined(separator: " · ")
-                Text(subtitle.isEmpty ? "goodsId: \(device.goodsId)" : subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Button {
+                    shower.toggleFavorite(goodsId: device.goodsId)
+                } label: {
+                    Image(systemName: isFav ? "star.fill" : "star")
+                        .font(.caption)
+                        .foregroundStyle(isFav ? .yellow : .secondary)
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
             }
 
-            Spacer()
-
-            Button {
-                confirmStartDevice = device
-            } label: {
-                Label("开水", systemImage: "drop.fill")
-                    .font(.subheadline.weight(.semibold))
+            HStack(spacing: 6) {
+                statusBadge(for: device)
+                if isHighlighted {
+                    Text("扫码")
+                        .font(.caption2.weight(.bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.cyan.opacity(0.25), in: Capsule())
+                        .foregroundStyle(.cyan)
+                }
             }
-            .buttonStyle(.glassProminent)
-            .tint(isHighlighted ? .cyan : (device.isIdle ? .cyan : .gray))
-            .disabled(isBusySession)
+
+            if device.isIdle {
+                Button {
+                    confirmStartDevice = device
+                } label: {
+                    Label("开水", systemImage: "drop.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glassProminent)
+                .tint(.cyan)
+                .controlSize(.small)
+                .disabled(isBusySession)
+            } else {
+                Button {
+                    confirmStartDevice = device
+                } label: {
+                    Label(device.isBusy ? "使用中" : "尝试开水", systemImage: device.isBusy ? "person.fill" : "drop")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+                .disabled(isBusySession)
+            }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .glassEffect(isHighlighted ? .regular.tint(.cyan) : .regular, in: .rect(cornerRadius: 22))
+        .padding(14)
+        .glassEffect(
+            isHighlighted ? .regular.tint(.cyan) : (device.isBusy ? .regular.tint(.orange) : .regular),
+            in: .rect(cornerRadius: 22)
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .strokeBorder(isHighlighted ? Color.cyan.opacity(0.7) : Color.clear, lineWidth: 1.5)
+                .strokeBorder(
+                    isHighlighted ? Color.cyan.opacity(0.75) : (device.isIdle ? Color.green.opacity(0.25) : Color.clear),
+                    lineWidth: isHighlighted ? 1.8 : 1
+                )
         )
+    }
+
+    private func statusBadge(for device: QiekjDevice) -> some View {
+        let color: Color = {
+            switch device.availability {
+            case .idle: return .green
+            case .busy: return .orange
+            case .fault: return .red
+            case .unknown: return .secondary
+            }
+        }()
+
+        return HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
+            Text(device.statusLabel)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(color)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(color.opacity(0.16), in: Capsule())
     }
 
     private var recentBillsSection: some View {

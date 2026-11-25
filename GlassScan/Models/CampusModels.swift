@@ -8,6 +8,13 @@ struct QiekjBalance: Codable, Equatable, Sendable {
     let integralAmount: String
 }
 
+enum StallAvailability: String, Codable, Equatable, Sendable {
+    case idle
+    case busy
+    case fault
+    case unknown
+}
+
 struct QiekjDevice: Codable, Equatable, Identifiable, Hashable, Sendable {
     let goodsId: String
     let goodsName: String
@@ -19,21 +26,114 @@ struct QiekjDevice: Codable, Equatable, Identifiable, Hashable, Sendable {
     let workStatus: Int?
     let skuId: String?
     let imei: String?
+    var remainSeconds: Int? = nil
+    var errorMessage: String? = nil
 
     var id: String { goodsId }
 
+    /// Parsed numeric layout, e.g. `90403` → building `9`, floor `4`, stall `3`; `120403` → building `12`, floor `4`, stall `3`.
+    var parsedLocation: (building: Int, floor: Int, stall: Int)? {
+        let digits = goodsName.filter(\.isNumber)
+        if digits.count == 5,
+           let b = Int(digits.prefix(1)),
+           let f = Int(digits.dropFirst(1).prefix(2)),
+           let s = Int(digits.suffix(2)) {
+            return (b, f, s)
+        }
+        if digits.count == 6,
+           let b = Int(digits.prefix(2)),
+           let f = Int(digits.dropFirst(2).prefix(2)),
+           let s = Int(digits.suffix(2)) {
+            return (b, f, s)
+        }
+        if digits.count == 4,
+           let b = Int(digits.prefix(1)),
+           let f = Int(digits.dropFirst(1).prefix(1)),
+           let s = Int(digits.suffix(2)) {
+            return (b, f, s)
+        }
+        return nil
+    }
+
+    var buildingKey: String {
+        if let loc = parsedLocation {
+            return "\(loc.building)号楼"
+        }
+        return parentPointName.isEmpty ? "其他区域" : parentPointName
+    }
+
+    var buildingSortOrder: Int {
+        parsedLocation?.building ?? 999
+    }
+
+    var floorNumber: Int? {
+        parsedLocation?.floor
+    }
+
+    var stallNumber: Int? {
+        parsedLocation?.stall
+    }
+
+    var shortStallTitle: String {
+        if let stall = stallNumber {
+            return String(format: "%02d号隔间", stall)
+        }
+        return goodsName
+    }
+
+    var floorLabel: String {
+        if let loc = parsedLocation {
+            return "\(loc.building)号楼 \(loc.floor)层"
+        }
+        return parentPointName.isEmpty ? orgName : parentPointName
+    }
+
+    var availability: StallAvailability {
+        if let errorMessage, !errorMessage.isEmpty {
+            return .fault
+        }
+        if let remainSeconds, remainSeconds > 0 {
+            return .busy
+        }
+        guard let ws = workStatus else {
+            return .unknown
+        }
+        switch ws {
+        case 0, 1, 10:
+            return .idle
+        case 2, 20, 21, 22:
+            return .busy
+        case 3, 4, 30, 40, 50:
+            return .fault
+        default:
+            return .unknown
+        }
+    }
+
     var isIdle: Bool {
-        // Observed on campus showers: 10 or 1 = idle, 2 = in use
-        guard let workStatus else { return true }
-        return workStatus == 10 || workStatus == 1 || workStatus == 0
+        availability == .idle
+    }
+
+    var isBusy: Bool {
+        availability == .busy
     }
 
     var statusLabel: String {
-        guard let workStatus else { return "可尝试" }
-        switch workStatus {
-        case 0, 1, 10: return "空闲"
-        case 2: return "使用中"
-        default: return "状态 \(workStatus)"
+        switch availability {
+        case .idle:
+            return "空闲"
+        case .busy:
+            if let remainSeconds, remainSeconds > 0 {
+                return "使用中 · 约\(max(1, remainSeconds / 60))分"
+            }
+            return "使用中"
+        case .fault:
+            return errorMessage?.isEmpty == false ? (errorMessage ?? "故障") : "离线/维护"
+        case .unknown:
+            if let ws = workStatus {
+                return "状态 \(ws)"
+            }
+            return "未刷新"
         }
     }
 }

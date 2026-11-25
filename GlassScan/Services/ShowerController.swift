@@ -29,6 +29,26 @@ final class ShowerController {
     var highlightedDevice: QiekjDevice?
     var unmatchedScanSN: String?
 
+    /// Persisted building & floor selection (e.g. "9号楼", floor 4)
+    var selectedBuilding: String? {
+        didSet {
+            if let selectedBuilding {
+                UserDefaults.standard.set(selectedBuilding, forKey: Self.selectedBuildingKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.selectedBuildingKey)
+            }
+        }
+    }
+    var selectedFloor: Int? {
+        didSet {
+            if let selectedFloor {
+                UserDefaults.standard.set(selectedFloor, forKey: Self.selectedFloorKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.selectedFloorKey)
+            }
+        }
+    }
+
     private var activeSnapshot: ActiveShowerSnapshot? {
         didSet { persistActiveSnapshot() }
     }
@@ -41,6 +61,9 @@ final class ShowerController {
     private static let favoritesKey = "qiekj_favorite_goods_ids"
     private static let cachedDevicesKey = "qiekj_cached_devices_v1"
     private static let activeSnapshotKey = "qiekj_active_shower_v1"
+    private static let selectedBuildingKey = "qiekj_selected_building_v1"
+    private static let selectedFloorKey = "qiekj_selected_floor_v1"
+    private static let userPickedFloorKey = "qiekj_user_picked_floor_v1"
 
     var isLoggedIn: Bool {
         !KeychainStore.read(.qiekjToken).isEmpty
@@ -54,6 +77,10 @@ final class ShowerController {
         if let data = UserDefaults.standard.data(forKey: Self.cachedDevicesKey),
            let cached = try? JSONDecoder().decode([QiekjDevice].self, from: data) {
             self.devices = cached
+        }
+        self.selectedBuilding = UserDefaults.standard.string(forKey: Self.selectedBuildingKey)
+        if UserDefaults.standard.object(forKey: Self.selectedFloorKey) != nil {
+            self.selectedFloor = UserDefaults.standard.integer(forKey: Self.selectedFloorKey)
         }
         // Restore active shower if iOS suspended/restarted the app mid-shower
         if let data = UserDefaults.standard.data(forKey: Self.activeSnapshotKey),
@@ -91,6 +118,46 @@ final class ShowerController {
         unmatchedScanSN = nil
     }
 
+    func selectBuilding(_ building: String?) {
+        UserDefaults.standard.set(true, forKey: Self.userPickedFloorKey)
+        selectedBuilding = building
+        let floors = availableFloors(for: building)
+        if let current = selectedFloor, !floors.contains(current) {
+            selectedFloor = floors.first
+        }
+    }
+
+    func selectFloor(_ floor: Int?) {
+        UserDefaults.standard.set(true, forKey: Self.userPickedFloorKey)
+        selectedFloor = floor
+    }
+
+    var availableBuildings: [String] {
+        var orderMap: [String: Int] = [:]
+        for d in devices {
+            let key = d.buildingKey
+            if let existing = orderMap[key] {
+                orderMap[key] = min(existing, d.buildingSortOrder)
+            } else {
+                orderMap[key] = d.buildingSortOrder
+            }
+        }
+        return orderMap.keys.sorted { a, b in
+            let oa = orderMap[a] ?? 999
+            let ob = orderMap[b] ?? 999
+            if oa != ob { return oa < ob }
+            return a.localizedStandardCompare(b) == .orderedAscending
+        }
+    }
+
+    func availableFloors(for building: String?) -> [Int] {
+        let filtered = devices.filter { d in
+            guard let building else { return true }
+            return d.buildingKey == building
+        }
+        return Array(Set(filtered.compactMap(\.floorNumber))).sorted()
+    }
+
     var sortedDevices: [QiekjDevice] {
         devices.sorted { a, b in
             if highlightedDevice?.goodsId == a.goodsId { return true }
@@ -98,7 +165,9 @@ final class ShowerController {
             let favA = favoriteGoodsIDs.contains(a.goodsId)
             let favB = favoriteGoodsIDs.contains(b.goodsId)
             if favA != favB { return favA }
-            if a.isIdle != b.isIdle { return a.isIdle }
+            if a.buildingSortOrder != b.buildingSortOrder { return a.buildingSortOrder < b.buildingSortOrder }
+            if let fa = a.floorNumber, let fb = b.floorNumber, fa != fb { return fa < fb }
+            if let sa = a.stallNumber, let sb = b.stallNumber, sa != sb { return sa < sb }
             return a.goodsName.localizedStandardCompare(b.goodsName) == .orderedAscending
         }
     }
@@ -200,17 +269,36 @@ final class ShowerController {
                     parentPointName: d.parentPointName,
                     workStatus: d.workStatus,
                     skuId: d.skuId ?? mergedById[d.goodsId]?.skuId,
-                    imei: d.imei ?? oldImeiById[d.goodsId]
+                    imei: d.imei ?? oldImeiById[d.goodsId],
+                    remainSeconds: d.remainSeconds,
+                    errorMessage: d.errorMessage
                 )
             }
         }
 
         self.devices = Array(mergedById.values)
         saveDevicesCache()
+
+        // First-time smart default: pre-select the user's most recently used building & floor!
+        if !UserDefaults.standard.bool(forKey: Self.userPickedFloorKey) {
+            if let anchor = latest.first ?? devices.first(where: { $0.goodsId == orders.first?.goodsId }),
+               let loc = anchor.parsedLocation {
+                selectedBuilding = "\(loc.building)号楼"
+                selectedFloor = loc.floor
+            }
+        }
+
+        var statusHistogram: [String: Int] = [:]
+        for d in devices {
+            let key = d.workStatus.map(String.init) ?? "nil"
+            statusHistogram[key, default: 0] += 1
+        }
+        let histText = statusHistogram.keys.sorted().map { "\($0):\(statusHistogram[$0] ?? 0)" }.joined(separator: ", ")
         AppLog.shared.record(
             .info,
             module: .shower,
-            "刷新完成：总隔间 \(devices.count) 台（latestUsed=\(latest.count), 历史订单=\(orders.count), nearMachines=\(nearCount)）"
+            "刷新完成：总隔间 \(devices.count) 台（latestUsed=\(latest.count), 订单=\(orders.count), near=\(nearCount)）",
+            detail: "workStatus 分布：\(histText)\n楼栋：\(availableBuildings.joined(separator: ", "))"
         )
     }
 
@@ -220,12 +308,20 @@ final class ShowerController {
         unmatchedScanSN = nil
         AppLog.shared.record(.info, module: .scan, "开始解析胖乖洗澡码：SN=\(sn ?? "-") goodsId=\(goodsId ?? "-")")
 
+        func focusDevice(_ dev: QiekjDevice) -> QiekjDevice {
+            highlightedDevice = dev
+            if let loc = dev.parsedLocation {
+                selectedBuilding = "\(loc.building)号楼"
+                selectedFloor = loc.floor
+            }
+            return dev
+        }
+
         // 1. Direct goodsId match
         if let goodsId, !goodsId.isEmpty {
             if let dev = await addDeviceByGoodsId(goodsId) {
-                highlightedDevice = dev
                 AppLog.shared.record(.info, module: .shower, "通过 goodsId 直接定位到隔间 \(dev.goodsName)")
-                return dev
+                return focusDevice(dev)
             }
         }
 
@@ -235,9 +331,8 @@ final class ShowerController {
 
         // 2. Instant local IMEI cache hit
         if let cachedMatch = devices.first(where: { $0.imei == sn }) {
-            highlightedDevice = cachedMatch
             AppLog.shared.record(.info, module: .shower, "本地 IMEI 缓存命中隔间 \(cachedMatch.goodsName) (SN=\(sn))")
-            return cachedMatch
+            return focusDevice(cachedMatch)
         }
 
         guard !token.isEmpty else {
@@ -249,9 +344,8 @@ final class ShowerController {
         // 3. Query backend `/goods/scan/v2`
         if let scannedGoodsId = await QiekjClient.shared.scanBySN(token: token, sn: sn, rawQRCode: rawText),
            let dev = await addDeviceByGoodsId(scannedGoodsId) {
-            highlightedDevice = dev
             AppLog.shared.record(.info, module: .shower, "扫码接口定位到隔间 \(dev.goodsName) (goodsId=\(dev.goodsId))")
-            return dev
+            return focusDevice(dev)
         }
 
         // 4. Fallback: refresh device list if empty, then build IMEI index via `goods/normal/details`
@@ -271,13 +365,14 @@ final class ShowerController {
                     parentPointName: candidate.parentPointName,
                     workStatus: candidate.workStatus,
                     skuId: candidate.skuId,
-                    imei: details.imei
+                    imei: details.imei,
+                    remainSeconds: candidate.remainSeconds,
+                    errorMessage: candidate.errorMessage
                 )
                 upsertDevice(updated)
                 if details.imei == sn {
-                    highlightedDevice = updated
                     AppLog.shared.record(.info, module: .shower, "IMEI 索引匹配成功：隔间 \(updated.goodsName) (SN=\(sn))")
-                    return updated
+                    return focusDevice(updated)
                 }
             }
         }

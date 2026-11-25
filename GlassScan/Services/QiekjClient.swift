@@ -151,26 +151,50 @@ actor QiekjClient {
         orgId: String = "0"
     ) async throws -> [QiekjDevice] {
         guard !shopId.isEmpty else { return [] }
-        let outcome = await postForm(
-            probeType: "qiekj_near_machines",
-            title: "胖乖附近设备列表",
-            path: "/appointNew/near/newMachines",
-            token: token,
-            form: [
-                ("goodsPage", "1"),
-                ("pageSize", "100"),
-                ("shopId", shopId),
-                ("machineTypeId", machineTypeId),
-                ("orgId", orgId),
-                ("token", token)
-            ],
-            isLoginAPI: false
-        )
-        try requireSuccess(outcome)
-        guard let root = outcome.jsonObject?["data"] else { return [] }
-        var collected: [QiekjDevice] = []
-        collectMachines(from: root, fallbackShopId: shopId, fallbackOrgId: orgId, fallbackCategory: machineTypeId, into: &collected)
-        return collected
+        var allCollected: [QiekjDevice] = []
+        var seenIDs: Set<String> = []
+
+        // Paginate up to 5 pages (500 stalls) so every building & floor is covered
+        for page in 1...5 {
+            let outcome = await postForm(
+                probeType: "qiekj_near_machines",
+                title: "胖乖附近设备列表 (第\(page)页)",
+                path: "/appointNew/near/newMachines",
+                token: token,
+                form: [
+                    ("goodsPage", String(page)),
+                    ("pageSize", "100"),
+                    ("shopId", shopId),
+                    ("machineTypeId", machineTypeId),
+                    ("orgId", orgId),
+                    ("token", token)
+                ],
+                isLoginAPI: false
+            )
+            try requireSuccess(outcome)
+            guard let root = outcome.jsonObject?["data"] else { break }
+
+            var pageItems: [QiekjDevice] = []
+            collectMachines(
+                from: root,
+                fallbackShopId: shopId,
+                fallbackOrgId: orgId,
+                fallbackCategory: machineTypeId,
+                into: &pageItems
+            )
+
+            var newlyAdded = 0
+            for item in pageItems {
+                if seenIDs.insert(item.goodsId).inserted {
+                    allCollected.append(item)
+                    newlyAdded += 1
+                }
+            }
+            if newlyAdded == 0 || pageItems.count < 80 {
+                break
+            }
+        }
+        return allCollected
     }
 
     func fetchSkuId(token: String, goodsId: String) async throws -> String {
@@ -636,9 +660,11 @@ actor QiekjClient {
             orgId: stringValue(dict["orgId"]) ?? "0",
             orgName: stringValue(dict["orgName"]) ?? "",
             parentPointName: stringValue(dict["parentPointName"]) ?? "",
-            workStatus: intValue(dict["workStatus"]) ?? intValue(dict["status"]),
+            workStatus: intValue(dict["workStatus"]) ?? intValue(dict["goodsStatus"]) ?? intValue(dict["status"]),
             skuId: stringValue(dict["skuId"]),
-            imei: stringValue(dict["imei"])
+            imei: stringValue(dict["imei"]),
+            remainSeconds: intValue(dict["remainTime"]),
+            errorMessage: stringValue(dict["deviceErrorMsg"])
         )
     }
 
@@ -663,9 +689,11 @@ actor QiekjClient {
                     orgId: stringValue(dict["orgId"]) ?? fallbackOrgId,
                     orgName: stringValue(dict["orgName"]) ?? "",
                     parentPointName: stringValue(dict["parentPointName"]) ?? stringValue(dict["pointName"]) ?? "",
-                    workStatus: intValue(dict["workStatus"]) ?? intValue(dict["status"]),
+                    workStatus: intValue(dict["workStatus"]) ?? intValue(dict["goodsStatus"]) ?? intValue(dict["status"]),
                     skuId: stringValue(dict["skuId"]),
-                    imei: stringValue(dict["imei"])
+                    imei: stringValue(dict["imei"]),
+                    remainSeconds: intValue(dict["remainTime"]),
+                    errorMessage: stringValue(dict["deviceErrorMsg"])
                 )
                 result.append(device)
             } else {
