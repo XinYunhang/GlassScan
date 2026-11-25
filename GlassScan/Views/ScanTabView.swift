@@ -1,0 +1,364 @@
+import PhotosUI
+import SwiftData
+import SwiftUI
+import UIKit
+
+struct ScanTabView: View {
+    @Binding var selectedTab: AppTabSelection
+
+    @Environment(ProbeCoordinator.self) private var coordinator
+    @Environment(\.modelContext) private var modelContext
+    @Query(sort: \ScanRecord.createdAt, order: .reverse) private var records: [ScanRecord]
+
+    @State private var isTorchOn = false
+    @State private var isScanningEnabled = true
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var latestRecord: ScanRecord?
+    @State private var presentingRecord: ScanRecord?
+    @State private var showManualInput = false
+    @State private var manualText = ""
+    @State private var toastMessage: String?
+
+    @Namespace private var glassNS
+
+    var body: some View {
+        ZStack {
+            // Full-bleed live camera feed gives true iOS 26 Liquid Glass optical refraction
+            CameraScannerView(
+                isTorchOn: $isTorchOn,
+                isScanningEnabled: $isScanningEnabled
+            ) { rawText, symbology in
+                triggerScan(rawText: rawText, symbology: symbology, source: .camera)
+            }
+            .ignoresSafeArea()
+
+            // Subtle corner reticle overlay
+            ScanReticleOverlay(isProbing: coordinator.isProbing)
+                .allowsHitTesting(false)
+
+            // Floating Liquid Glass chrome over the live optical backdrop
+            VStack(spacing: 14) {
+                topStatusBar
+                Spacer()
+                if let toastMessage {
+                    Text(toastMessage)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .glassEffect(.regular, in: .capsule)
+                        .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                }
+                if let latestRecord {
+                    latestResultCard(record: latestRecord)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                bottomLiquidDock
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 12)
+            .padding(.bottom, 22)
+        }
+        .sheet(item: $presentingRecord, onDismiss: {
+            isScanningEnabled = true
+        }) { record in
+            NavigationStack {
+                RecordDetailView(record: record)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button("完成") {
+                                presentingRecord = nil
+                            }
+                            .buttonStyle(.glassProminent)
+                        }
+                    }
+            }
+            .presentationDetents([.large, .medium])
+            .presentationDragIndicator(.visible)
+        }
+        .alert("输入或粘贴二维码原文", isPresented: $showManualInput) {
+            TextField("粘贴链接或设备码", text: $manualText)
+            Button("取消", role: .cancel) { manualText = "" }
+            Button("探测并保存") {
+                let text = manualText.trimmingCharacters(in: .whitespacesAndNewlines)
+                manualText = ""
+                if !text.isEmpty {
+                    triggerScan(rawText: text, symbology: "MANUAL", source: .paste)
+                }
+            }
+        }
+        .onChange(of: selectedPhotoItem) { _, newItem in
+            guard let newItem else { return }
+            Task {
+                if let data = try? await newItem.loadTransferable(type: Data.self),
+                   let decoded = await PhotoQRDecoder.decode(from: data) {
+                    triggerScan(rawText: decoded.0, symbology: decoded.1, source: .photo)
+                } else {
+                    showToast("图片中未识别到二维码")
+                }
+                selectedPhotoItem = nil
+            }
+        }
+    }
+
+    private var topStatusBar: some View {
+        GlassEffectContainer(spacing: 10) {
+            HStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    if coordinator.isProbing {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: isScanningEnabled ? "viewfinder" : "pause.circle.fill")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    Text(coordinator.isProbing ? "自动查询接口中…" : coordinator.statusBanner)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .glassEffect(.regular, in: .capsule)
+                .glassEffectID("scan-status-pill", in: glassNS)
+
+                Spacer(minLength: 4)
+
+                Button {
+                    selectedTab = .records
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "tray.full.fill")
+                            .font(.caption.weight(.semibold))
+                        Text("\(records.count)")
+                            .font(.subheadline.monospacedDigit().weight(.semibold))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .capsule)
+                .glassEffectID("scan-count-pill", in: glassNS)
+            }
+        }
+    }
+
+    private func latestResultCard(record: ScanRecord) -> some View {
+        GlassEffectContainer(spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    Image(systemName: record.platform.systemImage)
+                        .font(.title3.weight(.semibold))
+                        .frame(width: 36, height: 36)
+                        .glassEffect(.regular.tint(platformTint(record.platform)), in: .circle)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(record.displayTitle)
+                            .font(.headline)
+                            .lineLimit(1)
+                        Text(record.stabilityHint)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                            latestRecord = nil
+                            isScanningEnabled = true
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.bold))
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .circle)
+                }
+
+                // Quick one-tap labels for bathroom / laundry room
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(["胖乖洗澡", "U净洗衣机", "U净烘干机", "U净吹风机"], id: \.self) { label in
+                            Button(label) {
+                                record.note = label
+                                try? modelContext.save()
+                                showToast("已标记为「\(label)」")
+                            }
+                            .font(.caption.weight(.medium))
+                            .buttonStyle(.glass)
+                            .controlSize(.small)
+                        }
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        presentingRecord = record
+                    } label: {
+                        Label("查看查询数据 (\(record.probes.count))", systemImage: "doc.text.magnifyingglass")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.glassProminent)
+
+                    Button {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                            latestRecord = nil
+                            isScanningEnabled = true
+                        }
+                    } label: {
+                        Label("继续扫", systemImage: "qrcode.viewfinder")
+                    }
+                    .buttonStyle(.glass)
+                }
+            }
+            .padding(16)
+            .glassEffect(.regular, in: .rect(cornerRadius: 26))
+            .glassEffectID("latest-result-card", in: glassNS)
+        }
+    }
+
+    private var bottomLiquidDock: some View {
+        GlassEffectContainer(spacing: 14) {
+            HStack(spacing: 14) {
+                // Torch toggle
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                        isTorchOn.toggle()
+                    }
+                } label: {
+                    Image(systemName: isTorchOn ? "flashlight.on.fill" : "flashlight.off.fill")
+                        .font(.title3.weight(.semibold))
+                        .frame(width: 52, height: 52)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(
+                    isTorchOn ? .regular.tint(.yellow).interactive() : .regular.interactive(),
+                    in: .circle
+                )
+                .glassEffectID("dock-torch", in: glassNS)
+                .accessibilityLabel("手电筒")
+
+                // Photo library QR decode
+                PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.title3.weight(.semibold))
+                        .frame(width: 52, height: 52)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
+                .glassEffectID("dock-photo", in: glassNS)
+                .accessibilityLabel("从相册识码")
+
+                // Paste from clipboard or manual input
+                Button {
+                    if let pasted = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !pasted.isEmpty {
+                        manualText = pasted
+                    }
+                    showManualInput = true
+                } label: {
+                    Label("粘贴 / 输入", systemImage: "doc.on.clipboard")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 18)
+                        .frame(height: 52)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .capsule)
+                .glassEffectID("dock-paste", in: glassNS)
+
+                // Pause / Resume scan
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                        isScanningEnabled.toggle()
+                        if isScanningEnabled {
+                            latestRecord = nil
+                        }
+                    }
+                } label: {
+                    Image(systemName: isScanningEnabled ? "pause.fill" : "play.fill")
+                        .font(.title3.weight(.semibold))
+                        .frame(width: 52, height: 52)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(
+                    isScanningEnabled ? .regular.interactive() : .regular.tint(.blue).interactive(),
+                    in: .circle
+                )
+                .glassEffectID("dock-pause", in: glassNS)
+                .accessibilityLabel(isScanningEnabled ? "暂停扫描" : "继续扫描")
+            }
+        }
+    }
+
+    private func triggerScan(rawText: String, symbology: String, source: ScanSource) {
+        isScanningEnabled = false
+        Task {
+            let record = await coordinator.handleScannedCode(
+                rawText: rawText,
+                symbology: symbology,
+                source: source,
+                context: modelContext,
+                existingRecords: records
+            )
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.82)) {
+                latestRecord = record
+            }
+        }
+    }
+
+    private func showToast(_ message: String) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            toastMessage = message
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(2.2))
+            withAnimation(.easeInOut(duration: 0.25)) {
+                if toastMessage == message {
+                    toastMessage = nil
+                }
+            }
+        }
+    }
+
+    private func platformTint(_ platform: ScanPlatform) -> Color {
+        switch platform {
+        case .pangguai: return .cyan
+        case .ujing: return .blue
+        case .alipay: return .indigo
+        case .wechat: return .green
+        case .web: return .orange
+        case .text: return .gray
+        }
+    }
+}
+
+private struct ScanReticleOverlay: View {
+    let isProbing: Bool
+    @State private var pulse = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 32, style: .continuous)
+            .strokeBorder(
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(isProbing ? 0.95 : 0.7),
+                        Color.cyan.opacity(isProbing ? 0.9 : 0.35),
+                        Color.white.opacity(isProbing ? 0.95 : 0.7)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                lineWidth: isProbing ? 3 : 2
+            )
+            .frame(width: 248, height: 248)
+            .scaleEffect(pulse ? 1.02 : 0.99)
+            .shadow(color: .cyan.opacity(isProbing ? 0.45 : 0.15), radius: 16)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) {
+                    pulse = true
+                }
+            }
+    }
+}
