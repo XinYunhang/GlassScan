@@ -44,31 +44,12 @@ struct AccountsTabView: View {
                 // MARK: - Qiekj (Pangguai Shower)
                 Section {
                     LabeledContent("登录状态", value: qiekjTokenPreview)
+                    if shower.isLoggedIn && !qiekjPhone.isEmpty {
+                        LabeledContent("绑定手机", value: Sanitizer.maskPhone(qiekjPhone))
+                    }
                     if let bal = shower.balance {
                         LabeledContent("余额 / 积分", value: "¥\(bal.balance) · \(bal.integral) 积分")
                     }
-
-                    TextField("手机号", text: $qiekjPhone)
-                        .keyboardType(.numberPad)
-
-                    HStack {
-                        TextField("短信验证码", text: $qiekjCode)
-                            .keyboardType(.numberPad)
-                        Button(qiekjCooldown > 0 ? "\(qiekjCooldown)s" : "发验证码") {
-                            sendQiekjCode()
-                        }
-                        .buttonStyle(.glass)
-                        .disabled(qiekjBusy || qiekjCooldown > 0 || qiekjPhone.count < 11)
-                    }
-
-                    Button {
-                        loginQiekj()
-                    } label: {
-                        Label("登录胖乖生活", systemImage: "drop.fill")
-                    }
-                    .buttonStyle(.glassProminent)
-                    .tint(.cyan)
-                    .disabled(qiekjBusy || qiekjPhone.count < 11 || qiekjCode.isEmpty)
 
                     if shower.isLoggedIn {
                         Button {
@@ -85,12 +66,18 @@ struct AccountsTabView: View {
                         }
                         .disabled(qiekjBusy)
 
+                        DisclosureGroup("切换账号 / 重新登录") {
+                            qiekjLoginInputs
+                        }
+
                         Button("退出胖乖账号", role: .destructive) {
                             KeychainStore.delete(.qiekjToken)
                             shower.balance = nil
                             refreshPreviews()
                             feedbackMessage = "已清除胖乖登录态"
                         }
+                    } else {
+                        qiekjLoginInputs
                     }
 
                     DisclosureGroup("手动粘贴胖乖 Token") {
@@ -112,35 +99,22 @@ struct AccountsTabView: View {
                 // MARK: - Ujing (Laundry)
                 Section {
                     LabeledContent("登录状态", value: ujingTokenPreview)
-
-                    TextField("手机号", text: $ujingPhone)
-                        .keyboardType(.numberPad)
-
-                    HStack {
-                        TextField("短信验证码", text: $ujingCaptcha)
-                            .keyboardType(.numberPad)
-                        Button(ujingCooldown > 0 ? "\(ujingCooldown)s" : "发验证码") {
-                            sendUjingCaptcha()
-                        }
-                        .buttonStyle(.glass)
-                        .disabled(ujingBusy || ujingCooldown > 0 || ujingPhone.count < 11)
+                    if laundry.isLoggedIn && !ujingPhone.isEmpty {
+                        LabeledContent("绑定手机", value: Sanitizer.maskPhone(ujingPhone))
                     }
-
-                    Button {
-                        loginUjing()
-                    } label: {
-                        Label("登录 U净洗衣房", systemImage: "washer.fill")
-                    }
-                    .buttonStyle(.glassProminent)
-                    .tint(.indigo)
-                    .disabled(ujingBusy || ujingPhone.count < 11 || ujingCaptcha.isEmpty)
 
                     if laundry.isLoggedIn {
+                        DisclosureGroup("切换账号 / 重新登录") {
+                            ujingLoginInputs
+                        }
+
                         Button("退出 U净账号", role: .destructive) {
                             KeychainStore.delete(.ujingToken)
                             refreshPreviews()
                             feedbackMessage = "已清除 U净登录态"
                         }
+                    } else {
+                        ujingLoginInputs
                     }
 
                     DisclosureGroup("手动粘贴 U净 JWT") {
@@ -201,10 +175,61 @@ struct AccountsTabView: View {
                 }
             }
             .navigationTitle("我的账号")
+            .contentMargins(.bottom, 32, for: .scrollContent)
             .onAppear {
                 refreshPreviews()
             }
         }
+    }
+
+    @ViewBuilder
+    private var qiekjLoginInputs: some View {
+        TextField("手机号", text: $qiekjPhone)
+            .keyboardType(.numberPad)
+
+        HStack {
+            TextField("短信验证码", text: $qiekjCode)
+                .keyboardType(.numberPad)
+            Button(qiekjCooldown > 0 ? "\(qiekjCooldown)s" : "发验证码") {
+                sendQiekjCode()
+            }
+            .buttonStyle(.glass)
+            .disabled(qiekjBusy || qiekjCooldown > 0 || qiekjPhone.count < 11)
+        }
+
+        Button {
+            loginQiekj()
+        } label: {
+            Label("登录胖乖生活", systemImage: "drop.fill")
+        }
+        .buttonStyle(.glassProminent)
+        .tint(.cyan)
+        .disabled(qiekjBusy || qiekjPhone.count < 11 || qiekjCode.isEmpty)
+    }
+
+    @ViewBuilder
+    private var ujingLoginInputs: some View {
+        TextField("手机号", text: $ujingPhone)
+            .keyboardType(.numberPad)
+
+        HStack {
+            TextField("短信验证码", text: $ujingCaptcha)
+                .keyboardType(.numberPad)
+            Button(ujingCooldown > 0 ? "\(ujingCooldown)s" : "发验证码") {
+                sendUjingCaptcha()
+            }
+            .buttonStyle(.glass)
+            .disabled(ujingBusy || ujingCooldown > 0 || ujingPhone.count < 11)
+        }
+
+        Button {
+            loginUjing()
+        } label: {
+            Label("登录 U净洗衣房", systemImage: "washer.fill")
+        }
+        .buttonStyle(.glassProminent)
+        .tint(.indigo)
+        .disabled(ujingBusy || ujingPhone.count < 11 || ujingCaptcha.isEmpty)
     }
 
     private func refreshPreviews() {

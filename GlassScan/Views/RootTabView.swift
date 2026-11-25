@@ -43,6 +43,6 @@ struct RootTabView: View {
                 AccountsTabView(selectedTab: $selectedTab)
             }
         }
-        .tabBarMinimizeBehavior(.onScrollDown)
+        .tabBarMinimizeBehavior(.never)
     }
 }
