@@ -28,7 +28,7 @@ struct RootTabView: View {
             Tab("洗澡", systemImage: "drop.fill", value: AppTabSelection.shower) {
                 ShowerTabView(selectedTab: $selectedTab)
             }
-            .badge(showerActive ? ("洗" as String?) : nil)
+            .badge(showerActive ? 1 : 0)
 
             Tab("洗衣", systemImage: "washer.fill", value: AppTabSelection.laundry) {
                 LaundryTabView(selectedTab: $selectedTab)
