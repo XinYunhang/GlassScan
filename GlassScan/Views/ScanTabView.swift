@@ -317,13 +317,19 @@ struct ScanTabView: View {
     private func triggerScan(rawText: String, symbology: String, source: ScanSource) {
         isScanningEnabled = false
         let analysis = QRAnalyzer.analyze(rawText: rawText, existingRecords: records)
+        AppLog.shared.record(
+            .info,
+            module: .scan,
+            "扫到二维码 [\(analysis.platform.displayName)]（\(source.displayName)）",
+            detail: rawText
+        )
 
         Task {
             // In business mode, route Ujing washer/dryer directly into the order & payment sheet
             if businessMode && analysis.platform == .ujing && laundry.isLoggedIn {
+                showToast("正在识别 U净设备档位…")
                 let openedOrderSheet = await laundry.prepareFromQRCode(rawText)
                 if openedOrderSheet {
-                    // Record scan asynchronously without blocking the order sheet
                     _ = await coordinator.handleScannedCode(
                         rawText: rawText,
                         symbology: symbology,
@@ -337,12 +343,29 @@ struct ScanTabView: View {
                 }
             }
 
-            // In business mode, if Pangguai QR contains goodsId, auto-add to shower list
-            if businessMode && analysis.platform == .pangguai && shower.isLoggedIn {
-                if let gid = analysis.candidateGoodsId {
-                    _ = await shower.addDeviceByGoodsId(gid)
-                    showToast("已识别胖乖隔间并加入洗澡列表")
+            // In business mode, route Pangguai QR (`SN=...` or `goodsId=...`) directly to highlighted stall in Shower tab!
+            if businessMode && analysis.platform == .pangguai {
+                let sn = analysis.queryItems.first { $0.key.lowercased() == "sn" || $0.key.lowercased() == "imei" }?.value
+                showToast("正在定位当前洗澡隔间…")
+                let matched = await shower.resolveScannedShower(
+                    rawText: rawText,
+                    sn: sn,
+                    goodsId: analysis.candidateGoodsId
+                )
+                _ = await coordinator.handleScannedCode(
+                    rawText: rawText,
+                    symbology: symbology,
+                    source: source,
+                    context: modelContext,
+                    existingRecords: records
+                )
+                latestRecord = nil
+                isScanningEnabled = true
+                if let matched {
+                    showToast("已定位隔间 \(matched.goodsName)")
                 }
+                selectedTab = .shower
+                return
             }
 
             let record = await coordinator.handleScannedCode(

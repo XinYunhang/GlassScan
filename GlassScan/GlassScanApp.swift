@@ -24,6 +24,7 @@ struct GlassScanApp: App {
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     if newPhase == .active {
+                        showerController.resumePollingIfNeeded()
                         Task {
                             if let order = laundryController.activeOrder, !order.isTerminal {
                                 await laundryController.refreshActiveOrder(checkPayFirst: order.canPay)

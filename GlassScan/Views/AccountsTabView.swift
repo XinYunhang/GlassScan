@@ -159,8 +159,26 @@ struct AccountsTabView: View {
                     Label("U净（洗衣机 / 烘干机）", systemImage: "washer.fill")
                 }
 
-                // MARK: - Debug Records & Settings
-                Section("采样调试与脱敏导出") {
+                // MARK: - Logs, Debug Records & Settings
+                Section("日志、采样与脱敏导出") {
+                    NavigationLink {
+                        AppLogView()
+                    } label: {
+                        LabeledContent {
+                            HStack(spacing: 6) {
+                                if AppLog.shared.errorCount > 0 {
+                                    Text("\(AppLog.shared.errorCount) 异常")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.orange)
+                                }
+                                Text("\(AppLog.shared.entries.count) 条")
+                                    .foregroundStyle(.secondary)
+                            }
+                        } label: {
+                            Label("运行日志（可导出排错）", systemImage: "doc.text.magnifyingglass")
+                        }
+                    }
+
                     NavigationLink {
                         RecordsTabView()
                     } label: {

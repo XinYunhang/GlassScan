@@ -214,6 +214,33 @@ actor QiekjClient {
         )
     }
 
+    /// Resolves a scanned `SN` / QR URL via `/goods/scan/v2` to obtain `goodsId`.
+    func scanBySN(token: String, sn: String, rawQRCode: String) async -> String? {
+        let attempts: [[(String, String)]] = [
+            [("SN", sn), ("token", token)],
+            [("sn", sn), ("token", token)],
+            [("NQT", rawQRCode), ("token", token)],
+            [("imei", sn), ("token", token)]
+        ]
+        for form in attempts {
+            let outcome = await postForm(
+                probeType: "qiekj_scan_v2",
+                title: "胖乖扫码反查 (goods/scan/v2)",
+                path: "/goods/scan/v2",
+                token: token,
+                form: form,
+                isLoginAPI: false
+            )
+            if outcome.entry.success, let data = outcome.jsonObject?["data"] as? [String: Any] {
+                if let gid = stringValue(data["goodsId"]) ?? stringValue(data["id"]), !gid.isEmpty {
+                    AppLog.log(.info, module: .shower, "goods/scan/v2 成功命中 goodsId=\(gid)", detail: outcome.entry.rawBody)
+                    return gid
+                }
+            }
+        }
+        return nil
+    }
+
     func syncWater(token: String, skuId: String) async throws -> QiekjSyncStatus? {
         let outcome = await postForm(
             probeType: "qiekj_sync",
@@ -549,6 +576,15 @@ actor QiekjClient {
             if let code { summary += " · code=\(code)" }
             if let msg, !msg.isEmpty { summary += " · \(msg)" }
 
+            if probeType != "qiekj_sync" || !isSuccess {
+                AppLog.log(
+                    isSuccess ? .net : .warn,
+                    module: .shower,
+                    "POST \(path) → \(summary) (\(elapsed)ms)",
+                    detail: pretty
+                )
+            }
+
             return RequestOutcome(
                 entry: ProbeEntry(
                     probeType: probeType,
@@ -568,6 +604,7 @@ actor QiekjClient {
             )
         } catch {
             let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+            AppLog.log(.error, module: .shower, "POST \(path) 网络错误 (\(elapsed)ms)：\(error.localizedDescription)")
             return RequestOutcome(
                 entry: ProbeEntry(
                     probeType: probeType,

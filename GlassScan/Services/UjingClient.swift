@@ -563,6 +563,13 @@ actor UjingClient {
                 summary += " · deviceId=\(deviceId)"
             }
 
+            AppLog.log(
+                isSuccess ? .net : .warn,
+                module: .laundry,
+                "\(method) /\(path) → \(summary) (\(elapsed)ms)",
+                detail: pretty
+            )
+
             return RequestOutcome(
                 entry: ProbeEntry(
                     probeType: probeType,
@@ -582,6 +589,7 @@ actor UjingClient {
             )
         } catch {
             let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+            AppLog.log(.error, module: .laundry, "\(method) /\(path) 网络错误 (\(elapsed)ms)：\(error.localizedDescription)")
             return RequestOutcome(
                 entry: ProbeEntry(
                     probeType: probeType,

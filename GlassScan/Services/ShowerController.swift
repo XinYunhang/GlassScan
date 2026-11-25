@@ -1,6 +1,14 @@
 import Foundation
 import Observation
 
+struct ActiveShowerSnapshot: Codable, Equatable, Sendable {
+    let device: QiekjDevice
+    let skuId: String
+    let orderNo: String
+    let startedAt: Date
+    let appEndSupported: Bool
+}
+
 @MainActor
 @Observable
 final class ShowerController {
@@ -13,14 +21,26 @@ final class ShowerController {
     }
 
     var phase: ShowerSessionPhase = .idle
+    var stopErrorMessage: String?
     var isRefreshing = false
     var infoBanner: String?
 
-    private var activeTask: Task<Void, Never>?
+    /// Highlighted stall jumped to right after scanning a Pangguai QR code
+    var highlightedDevice: QiekjDevice?
+    var unmatchedScanSN: String?
+
+    private var activeSnapshot: ActiveShowerSnapshot? {
+        didSet { persistActiveSnapshot() }
+    }
+    private var pollTask: Task<Void, Never>?
+    private var stopTask: Task<Void, Never>?
+    private var lastIdentifyOrderNo: String?
+    private var everWorked = false
     private var stopRequested = false
 
     private static let favoritesKey = "qiekj_favorite_goods_ids"
     private static let cachedDevicesKey = "qiekj_cached_devices_v1"
+    private static let activeSnapshotKey = "qiekj_active_shower_v1"
 
     var isLoggedIn: Bool {
         !KeychainStore.read(.qiekjToken).isEmpty
@@ -35,6 +55,26 @@ final class ShowerController {
            let cached = try? JSONDecoder().decode([QiekjDevice].self, from: data) {
             self.devices = cached
         }
+        // Restore active shower if iOS suspended/restarted the app mid-shower
+        if let data = UserDefaults.standard.data(forKey: Self.activeSnapshotKey),
+           let snap = try? JSONDecoder().decode(ActiveShowerSnapshot.self, from: data) {
+            // Only auto-restore if started within the last 60 minutes
+            if Date().timeIntervalSince(snap.startedAt) < 3600 {
+                self.activeSnapshot = snap
+                self.phase = .running(
+                    device: snap.device,
+                    orderNo: snap.orderNo,
+                    startedAt: snap.startedAt,
+                    step: "已恢复进行中的洗澡会话",
+                    appEndSupported: snap.appEndSupported,
+                    stopping: false
+                )
+                AppLog.shared.record(.info, module: .shower, "冷启动恢复洗澡会话：隔间 \(snap.device.goodsName) orderNo=\(snap.orderNo)")
+                resumePollingIfNeeded()
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.activeSnapshotKey)
+            }
+        }
     }
 
     func toggleFavorite(goodsId: String) {
@@ -46,8 +86,15 @@ final class ShowerController {
         UserDefaults.standard.set(Array(favoriteGoodsIDs), forKey: Self.favoritesKey)
     }
 
+    func clearHighlight() {
+        highlightedDevice = nil
+        unmatchedScanSN = nil
+    }
+
     var sortedDevices: [QiekjDevice] {
         devices.sorted { a, b in
+            if highlightedDevice?.goodsId == a.goodsId { return true }
+            if highlightedDevice?.goodsId == b.goodsId { return false }
             let favA = favoriteGoodsIDs.contains(a.goodsId)
             let favB = favoriteGoodsIDs.contains(b.goodsId)
             if favA != favB { return favA }
@@ -65,6 +112,7 @@ final class ShowerController {
 
         isRefreshing = true
         defer { isRefreshing = false }
+        AppLog.shared.record(.info, module: .shower, "开始刷新胖乖余额、历史订单与隔间列表")
 
         async let balTask = QiekjClient.shared.fetchBalance(token: token)
         async let latestTask = QiekjClient.shared.fetchLatestDevices(token: token, categoryCode: "08")
@@ -77,7 +125,11 @@ final class ShowerController {
         if let bal { self.balance = bal }
         self.recentOrders = orders
 
-        // Merge by goodsId (latestUsed first, then historical orders, then full floor machines!)
+        // Preserve previously discovered IMEIs when merging
+        let oldImeiById = Dictionary(uniqueKeysWithValues: devices.compactMap { d in
+            d.imei.map { (d.goodsId, $0) }
+        })
+
         var mergedById: [String: QiekjDevice] = [:]
         for d in self.devices {
             mergedById[d.goodsId] = d
@@ -94,15 +146,25 @@ final class ShowerController {
                     parentPointName: "",
                     workStatus: nil,
                     skuId: o.skuId.isEmpty ? nil : o.skuId,
-                    imei: nil
+                    imei: oldImeiById[o.goodsId]
                 )
             }
         }
         for d in latest {
-            mergedById[d.goodsId] = d
+            mergedById[d.goodsId] = QiekjDevice(
+                goodsId: d.goodsId,
+                goodsName: d.goodsName,
+                categoryCode: d.categoryCode,
+                shopId: d.shopId,
+                orgId: d.orgId,
+                orgName: d.orgName,
+                parentPointName: d.parentPointName,
+                workStatus: d.workStatus,
+                skuId: d.skuId ?? mergedById[d.goodsId]?.skuId,
+                imei: d.imei ?? oldImeiById[d.goodsId]
+            )
         }
 
-        // Discover all stalls in the same campus shop via `appointNew/near/newMachines`
         let shopId = latest.first(where: { !$0.shopId.isEmpty })?.shopId
             ?? orders.first(where: { !$0.shopId.isEmpty })?.shopId
             ?? ""
@@ -110,6 +172,7 @@ final class ShowerController {
             ?? orders.first(where: { !$0.orgId.isEmpty && $0.orgId != "0" })?.orgId
             ?? "0"
 
+        var nearCount = 0
         if !shopId.isEmpty {
             var nearList = (try? await QiekjClient.shared.fetchNearMachines(
                 token: token,
@@ -125,15 +188,103 @@ final class ShowerController {
                     orgId: "0"
                 )) ?? []
             }
+            nearCount = nearList.count
             for d in nearList {
-                mergedById[d.goodsId] = d
+                mergedById[d.goodsId] = QiekjDevice(
+                    goodsId: d.goodsId,
+                    goodsName: d.goodsName,
+                    categoryCode: d.categoryCode,
+                    shopId: d.shopId,
+                    orgId: d.orgId,
+                    orgName: d.orgName,
+                    parentPointName: d.parentPointName,
+                    workStatus: d.workStatus,
+                    skuId: d.skuId ?? mergedById[d.goodsId]?.skuId,
+                    imei: d.imei ?? oldImeiById[d.goodsId]
+                )
             }
         }
 
         self.devices = Array(mergedById.values)
-        if let encoded = try? JSONEncoder().encode(self.devices) {
-            UserDefaults.standard.set(encoded, forKey: Self.cachedDevicesKey)
+        saveDevicesCache()
+        AppLog.shared.record(
+            .info,
+            module: .shower,
+            "刷新完成：总隔间 \(devices.count) 台（latestUsed=\(latest.count), 历史订单=\(orders.count), nearMachines=\(nearCount)）"
+        )
+    }
+
+    /// Resolves a scanned Pangguai QR code (`SN=...` or `goodsId=...`) to the exact stall and highlights it!
+    func resolveScannedShower(rawText: String, sn: String?, goodsId: String?) async -> QiekjDevice? {
+        let token = KeychainStore.read(.qiekjToken)
+        unmatchedScanSN = nil
+        AppLog.shared.record(.info, module: .scan, "开始解析胖乖洗澡码：SN=\(sn ?? "-") goodsId=\(goodsId ?? "-")")
+
+        // 1. Direct goodsId match
+        if let goodsId, !goodsId.isEmpty {
+            if let dev = await addDeviceByGoodsId(goodsId) {
+                highlightedDevice = dev
+                AppLog.shared.record(.info, module: .shower, "通过 goodsId 直接定位到隔间 \(dev.goodsName)")
+                return dev
+            }
         }
+
+        guard let sn, !sn.isEmpty else {
+            return nil
+        }
+
+        // 2. Instant local IMEI cache hit
+        if let cachedMatch = devices.first(where: { $0.imei == sn }) {
+            highlightedDevice = cachedMatch
+            AppLog.shared.record(.info, module: .shower, "本地 IMEI 缓存命中隔间 \(cachedMatch.goodsName) (SN=\(sn))")
+            return cachedMatch
+        }
+
+        guard !token.isEmpty else {
+            unmatchedScanSN = sn
+            AppLog.shared.record(.warn, module: .shower, "未登录胖乖，无法解析 SN=\(sn)")
+            return nil
+        }
+
+        // 3. Query backend `/goods/scan/v2`
+        if let scannedGoodsId = await QiekjClient.shared.scanBySN(token: token, sn: sn, rawQRCode: rawText),
+           let dev = await addDeviceByGoodsId(scannedGoodsId) {
+            highlightedDevice = dev
+            AppLog.shared.record(.info, module: .shower, "扫码接口定位到隔间 \(dev.goodsName) (goodsId=\(dev.goodsId))")
+            return dev
+        }
+
+        // 4. Fallback: refresh device list if empty, then build IMEI index via `goods/normal/details`
+        if devices.isEmpty {
+            await refreshAll()
+        }
+        let candidates = devices.filter { $0.imei == nil || $0.imei?.isEmpty == true }.prefix(25)
+        for candidate in candidates {
+            if let details = try? await QiekjClient.shared.fetchDeviceDetails(token: token, goodsId: candidate.goodsId) {
+                let updated = QiekjDevice(
+                    goodsId: candidate.goodsId,
+                    goodsName: details.name.isEmpty ? candidate.goodsName : details.name,
+                    categoryCode: details.categoryCode,
+                    shopId: candidate.shopId,
+                    orgId: candidate.orgId,
+                    orgName: candidate.orgName,
+                    parentPointName: candidate.parentPointName,
+                    workStatus: candidate.workStatus,
+                    skuId: candidate.skuId,
+                    imei: details.imei
+                )
+                upsertDevice(updated)
+                if details.imei == sn {
+                    highlightedDevice = updated
+                    AppLog.shared.record(.info, module: .shower, "IMEI 索引匹配成功：隔间 \(updated.goodsName) (SN=\(sn))")
+                    return updated
+                }
+            }
+        }
+
+        unmatchedScanSN = sn
+        AppLog.shared.record(.warn, module: .shower, "暂未将 SN=\(sn) 匹配到已知隔间（已搜索 \(devices.count) 台设备）")
+        return nil
     }
 
     func addDeviceByGoodsId(_ goodsId: String) async -> QiekjDevice? {
@@ -144,35 +295,32 @@ final class ShowerController {
         do {
             let details = try await QiekjClient.shared.fetchDeviceDetails(token: token, goodsId: trimmed)
             let skuId = try? await QiekjClient.shared.fetchSkuId(token: token, goodsId: trimmed)
+            let existing = devices.first(where: { $0.goodsId == details.goodsId })
             let device = QiekjDevice(
                 goodsId: details.goodsId,
                 goodsName: details.name,
                 categoryCode: details.categoryCode,
-                shopId: devices.first?.shopId ?? "",
-                orgId: devices.first?.orgId ?? "0",
-                orgName: devices.first?.orgName ?? "",
-                parentPointName: "",
-                workStatus: 10,
-                skuId: skuId,
+                shopId: existing?.shopId ?? devices.first?.shopId ?? "",
+                orgId: existing?.orgId ?? devices.first?.orgId ?? "0",
+                orgName: existing?.orgName ?? devices.first?.orgName ?? "",
+                parentPointName: existing?.parentPointName ?? "",
+                workStatus: existing?.workStatus ?? 10,
+                skuId: skuId ?? existing?.skuId,
                 imei: details.imei
             )
-            if let idx = devices.firstIndex(where: { $0.goodsId == device.goodsId }) {
-                devices[idx] = device
-            } else {
-                devices.insert(device, at: 0)
-            }
-            if let encoded = try? JSONEncoder().encode(devices) {
-                UserDefaults.standard.set(encoded, forKey: Self.cachedDevicesKey)
-            }
+            upsertDevice(device)
             return device
         } catch {
             infoBanner = "添加设备失败：\(error.localizedDescription)"
+            AppLog.shared.record(.error, module: .shower, "按 goodsId=\(trimmed) 添加设备失败：\(error.localizedDescription)")
             return nil
         }
     }
 
+    // MARK: - Start / Poll / Stop / Settle Lifecycle
+
     func startShower(device: QiekjDevice) {
-        guard activeTask == nil else { return }
+        guard pollTask == nil else { return }
         let token = KeychainStore.read(.qiekjToken)
         guard !token.isEmpty else {
             phase = .failed(message: "请先前往「我的」页登录胖乖生活")
@@ -180,27 +328,82 @@ final class ShowerController {
         }
 
         stopRequested = false
+        everWorked = false
+        lastIdentifyOrderNo = nil
+        stopErrorMessage = nil
         phase = .preparing(device: device, step: "正在获取设备 SKU…")
+        AppLog.shared.record(.info, module: .shower, "开始启动洗澡：隔间 \(device.goodsName) (goodsId=\(device.goodsId))")
 
-        activeTask = Task { [weak self] in
+        pollTask = Task { [weak self] in
             guard let self else { return }
-            defer { self.activeTask = nil }
-            await self.runShowerPipeline(device: device, token: token)
+            await self.runUnlockAndPoll(device: device, token: token)
         }
     }
 
-    func requestStopShower() {
-        stopRequested = true
-        if case let .running(device, orderNo, startedAt, _, appEndSupported, _) = phase {
-            phase = .running(
-                device: device,
-                orderNo: orderNo,
-                startedAt: startedAt,
-                step: appEndSupported ? "正在下发远程停阀…" : "请在设备端按结束按钮，等待回报…",
-                appEndSupported: appEndSupported,
-                stopping: true
-            )
+    func resumePollingIfNeeded() {
+        guard pollTask == nil, let snap = activeSnapshot else { return }
+        let token = KeychainStore.read(.qiekjToken)
+        guard !token.isEmpty else { return }
+        pollTask = Task { [weak self] in
+            guard let self else { return }
+            await self.pollLoop(snapshot: snap, token: token)
         }
+    }
+
+    /// Immediately invokes `POST /goods/endWater` without waiting for the poll timer!
+    func requestStopShower() {
+        guard let snap = activeSnapshot else {
+            phase = .idle
+            return
+        }
+        let token = KeychainStore.read(.qiekjToken)
+        guard !token.isEmpty else { return }
+
+        stopRequested = true
+        stopErrorMessage = nil
+        phase = .running(
+            device: snap.device,
+            orderNo: snap.orderNo,
+            startedAt: snap.startedAt,
+            step: "正在发送远程停阀指令…",
+            appEndSupported: snap.appEndSupported,
+            stopping: true
+        )
+        AppLog.shared.record(.info, module: .shower, "用户点击「结束洗澡」：立即请求 goods/endWater (goodsId=\(snap.device.goodsId))")
+
+        stopTask?.cancel()
+        stopTask = Task { [weak self] in
+            guard let self else { return }
+            await self.performImmediateStop(snapshot: snap, token: token)
+        }
+    }
+
+    /// Lets the user settle the bill directly if they pressed the physical stop button on the machine.
+    func forceSettleCurrentSession() {
+        guard let snap = activeSnapshot else { return }
+        let token = KeychainStore.read(.qiekjToken)
+        guard !token.isEmpty else { return }
+
+        pollTask?.cancel()
+        pollTask = nil
+        stopTask?.cancel()
+        stopTask = nil
+        AppLog.shared.record(.info, module: .shower, "用户手动触发结算账单：orderNo=\(lastIdentifyOrderNo ?? snap.orderNo)")
+
+        Task {
+            await settleSession(snapshot: snap, token: token)
+        }
+    }
+
+    func forceDismissActiveSession() {
+        pollTask?.cancel()
+        pollTask = nil
+        stopTask?.cancel()
+        stopTask = nil
+        activeSnapshot = nil
+        stopErrorMessage = nil
+        phase = .idle
+        AppLog.shared.record(.warn, module: .shower, "用户手动关闭本地洗澡状态面板")
     }
 
     func dismissResult() {
@@ -211,7 +414,7 @@ final class ShowerController {
         }
     }
 
-    private func runShowerPipeline(device: QiekjDevice, token: String) async {
+    private func runUnlockAndPoll(device: QiekjDevice, token: String) async {
         do {
             phase = .preparing(device: device, step: "正在获取设备 SKU…")
             let skuId = try await QiekjClient.shared.fetchSkuId(token: token, goodsId: device.goodsId)
@@ -223,139 +426,239 @@ final class ShowerController {
             let details = try await QiekjClient.shared.fetchDeviceDetails(token: token, goodsId: device.goodsId)
             let appEndSupported = details.supportAppUserFinish ?? true
 
-            phase = .preparing(device: device, step: "正在进行风控预检…")
+            // Save discovered IMEI back to device cache
+            let enrichedDevice = QiekjDevice(
+                goodsId: device.goodsId,
+                goodsName: details.name.isEmpty ? device.goodsName : details.name,
+                categoryCode: details.categoryCode,
+                shopId: device.shopId,
+                orgId: device.orgId,
+                orgName: device.orgName,
+                parentPointName: device.parentPointName,
+                workStatus: device.workStatus,
+                skuId: skuId,
+                imei: details.imei
+            )
+            upsertDevice(enrichedDevice)
+
+            phase = .preparing(device: enrichedDevice, step: "正在进行风控预检…")
             try await QiekjClient.shared.checkUserIsRisk(token: token)
 
-            phase = .preparing(device: device, step: "正在确认先用后付通道…")
+            phase = .preparing(device: enrichedDevice, step: "正在确认先用后付通道…")
             try await QiekjClient.shared.addUserAfterPayChannel(token: token)
 
-            phase = .preparing(device: device, step: "正在进行位置校验…")
+            phase = .preparing(device: enrichedDevice, step: "正在进行位置校验…")
             let catCode = details.categoryCode.isEmpty ? "08" : details.categoryCode
             try await QiekjClient.shared.isCheckLocation(token: token, categoryCode: catCode, imei: details.imei)
 
-            phase = .preparing(device: device, step: "正在云端开阀出水…")
+            phase = .preparing(device: enrichedDevice, step: "正在云端开阀出水…")
             let orderNo = try await QiekjClient.shared.unlockWater(
                 token: token,
                 skuId: skuId,
                 usePoints: usePoints
             )
 
-            let startedAt = Date()
-            phase = .running(
-                device: device,
+            let snap = ActiveShowerSnapshot(
+                device: enrichedDevice,
+                skuId: skuId,
                 orderNo: orderNo,
-                startedAt: startedAt,
+                startedAt: Date(),
+                appEndSupported: appEndSupported
+            )
+            activeSnapshot = snap
+            highlightedDevice = nil
+            phase = .running(
+                device: enrichedDevice,
+                orderNo: orderNo,
+                startedAt: snap.startedAt,
                 step: "已开阀出水中",
                 appEndSupported: appEndSupported,
                 stopping: false
             )
+            AppLog.shared.record(
+                .info,
+                module: .shower,
+                "云端开阀成功：隔间 \(enrichedDevice.goodsName) orderNo=\(orderNo) skuId=\(skuId) appEndSupported=\(appEndSupported)"
+            )
 
             try? await Task.sleep(for: .seconds(2))
+            await pollLoop(snapshot: snap, token: token)
+        } catch {
+            pollTask = nil
+            activeSnapshot = nil
+            phase = .failed(message: error.localizedDescription)
+            AppLog.shared.record(.error, module: .shower, "启动洗澡失败：\(error.localizedDescription)")
+        }
+    }
 
-            // Poll every 2 seconds for up to 30 minutes (900 attempts)
-            let maxAttempts = 900
-            var attempts = 0
-            var everWorked = false
-            var emptyStreak = 0
-            var lastSync: QiekjSyncStatus?
-            var remoteEndAttempted = false
-            var remoteEndAccepted = false
-            var remoteEndDeadline: Date?
+    private func pollLoop(snapshot: ActiveShowerSnapshot, token: String) async {
+        defer { pollTask = nil }
 
-            while attempts < maxAttempts {
-                if Task.isCancelled { return }
-                attempts += 1
+        var lastLoggedSignature = ""
+        var attempts = 0
+        let maxAttempts = 720 // 3s * 720 = 36 minutes
 
-                let sync = try await QiekjClient.shared.syncWater(token: token, skuId: skuId)
+        while attempts < maxAttempts {
+            if Task.isCancelled || stopRequested { return }
+            attempts += 1
 
-                if sync == nil {
-                    emptyStreak += 1
-                    if everWorked || remoteEndAccepted {
-                        break // Device closed session → proceed to settle!
-                    }
-                    if emptyStreak >= 6 {
-                        throw QiekjClientError(code: -1, message: "设备未响应，可能已离线或被占用")
-                    }
-                    try? await Task.sleep(for: .seconds(2))
-                    continue
+            do {
+                let sync = try await QiekjClient.shared.syncWater(token: token, skuId: snapshot.skuId)
+                let sig = sync.map { "ws=\($0.workStatus.map(String.init) ?? "nil"),st=\($0.status.map(String.init) ?? "nil"),id=\($0.identify ?? "")" } ?? "nil"
+                if sig != lastLoggedSignature {
+                    lastLoggedSignature = sig
+                    AppLog.shared.record(.info, module: .shower, "用水状态轮询变化（第 \(attempts) 次）：\(sig)")
                 }
 
-                emptyStreak = 0
-                lastSync = sync
-                if sync?.workStatus == 2 {
-                    everWorked = true
+                if let sync {
+                    if let id = sync.identify, !id.isEmpty {
+                        lastIdentifyOrderNo = id
+                    }
+                    if sync.workStatus == 2 {
+                        everWorked = true
+                    }
+                    // Hardware/platform reports session finished
+                    if sync.status == 5 || (everWorked && sync.workStatus != 2) {
+                        AppLog.shared.record(.info, module: .shower, "检测到设备侧已停水（\(sig)），自动进入结算")
+                        await settleSession(snapshot: snapshot, token: token)
+                        return
+                    }
+                } else {
+                    // IMPORTANT: Never abort `.running` to `.failed` on nil!
+                    // Only auto-settle if we already confirmed water was flowing earlier.
+                    if everWorked {
+                        AppLog.shared.record(.info, module: .shower, "设备已关闭会话（sync=nil 且已出水），自动进入结算")
+                        await settleSession(snapshot: snapshot, token: token)
+                        return
+                    }
                 }
+            } catch {
+                AppLog.shared.record(.warn, module: .shower, "轮询 syncWater 暂时失败（保持会话不中断）：\(error.localizedDescription)")
+            }
 
-                if stopRequested {
-                    if !remoteEndAttempted {
-                        remoteEndAttempted = true
-                        if appEndSupported {
-                            phase = .running(
-                                device: device,
-                                orderNo: orderNo,
-                                startedAt: startedAt,
-                                step: "正在下发远程停阀，等待设备回报…",
-                                appEndSupported: appEndSupported,
-                                stopping: true
-                            )
-                            do {
-                                try await QiekjClient.shared.endWater(token: token, goodsId: device.goodsId)
-                                remoteEndAccepted = true
-                                remoteEndDeadline = Date().addingTimeInterval(20)
-                            } catch {
-                                remoteEndAccepted = false
-                                phase = .running(
-                                    device: device,
-                                    orderNo: orderNo,
-                                    startedAt: startedAt,
-                                    step: "远程关阀未受理，请在设备端按结束键",
-                                    appEndSupported: false,
-                                    stopping: true
-                                )
-                            }
-                        }
-                    }
+            try? await Task.sleep(for: .seconds(3))
+        }
+    }
 
-                    // Status == 5 means platform confirms session finished
-                    if sync?.status == 5 {
-                        break
-                    }
-                    if let deadline = remoteEndDeadline, Date() >= deadline {
+    private func performImmediateStop(snapshot: ActiveShowerSnapshot, token: String) async {
+        pollTask?.cancel()
+        pollTask = nil
+
+        var endWaterSucceeded = false
+        var endWaterFailureReason: String?
+
+        do {
+            try await QiekjClient.shared.endWater(token: token, goodsId: snapshot.device.goodsId)
+            endWaterSucceeded = true
+            AppLog.shared.record(.info, module: .shower, "远程停阀 goods/endWater 已受理，开始等待设备确认停水")
+        } catch {
+            endWaterFailureReason = error.localizedDescription
+            AppLog.shared.record(.error, module: .shower, "远程停阀 goods/endWater 失败：\(error.localizedDescription)")
+        }
+
+        if endWaterSucceeded {
+            phase = .running(
+                device: snapshot.device,
+                orderNo: snapshot.orderNo,
+                startedAt: snapshot.startedAt,
+                step: "远程停阀已受理，等待水控器回报结算…",
+                appEndSupported: snapshot.appEndSupported,
+                stopping: true
+            )
+
+            // Wait up to 12s for device to close session, then proceed to settle
+            for i in 1...8 {
+                try? await Task.sleep(for: .milliseconds(1500))
+                if let sync = try? await QiekjClient.shared.syncWater(token: token, skuId: snapshot.skuId) {
+                    if let id = sync.identify, !id.isEmpty { lastIdentifyOrderNo = id }
+                    AppLog.shared.record(.info, module: .shower, "停阀后同步 #\(i)：workStatus=\(sync.workStatus ?? -1) status=\(sync.status ?? -1)")
+                    if sync.status == 5 || sync.workStatus != 2 {
                         break
                     }
                 } else {
-                    // User closed physical valve on hardware
-                    if sync?.status == 5 || (everWorked && sync?.workStatus != 2) {
-                        break
-                    }
+                    AppLog.shared.record(.info, module: .shower, "停阀后同步 #\(i)：会话已关闭 (data=null)")
+                    break
                 }
-
-                try? await Task.sleep(for: .seconds(2))
             }
 
-            // Settle order
-            phase = .settling(device: device, step: "正在生成后付结算账单…")
-            let finalOrderNo = (lastSync?.identify?.isEmpty == false ? lastSync?.identify : nil) ?? orderNo
-            let elapsed = Int(Date().timeIntervalSince(startedAt))
+            await settleSession(snapshot: snapshot, token: token)
+        } else {
+            // Keep `.running` card visible with actionable buttons instead of trapping the user!
+            stopRequested = false
+            stopErrorMessage = "远程停阀失败：\(endWaterFailureReason ?? "设备无响应")。可点下方重试，或在设备上按停水键后点「立即结算」。"
+            phase = .running(
+                device: snapshot.device,
+                orderNo: snapshot.orderNo,
+                startedAt: snapshot.startedAt,
+                step: "远程停阀未成功（会话保留中）",
+                appEndSupported: snapshot.appEndSupported,
+                stopping: false
+            )
+            resumePollingIfNeeded()
+        }
+    }
 
+    private func settleSession(snapshot: ActiveShowerSnapshot, token: String) async {
+        phase = .settling(device: snapshot.device, step: "正在生成后付结算账单…")
+        let finalOrderNo = lastIdentifyOrderNo ?? snapshot.orderNo
+        let elapsed = max(0, Int(Date().timeIntervalSince(snapshot.startedAt)))
+
+        do {
             let orderId = try await QiekjClient.shared.createAfterPay(token: token, orderNo: finalOrderNo)
-            phase = .settling(device: device, step: "正在查询本次消费明细…")
+            phase = .settling(device: snapshot.device, step: "正在查询本次消费明细…")
             let detail = try await QiekjClient.shared.fetchOrderDetail(token: token, orderId: orderId)
 
             let receipt = QiekjShowerReceipt(
                 orderNo: finalOrderNo,
                 orderId: orderId,
-                goodsName: device.goodsName,
+                goodsName: snapshot.device.goodsName,
                 realPrice: detail.realPrice,
                 originPrice: detail.originPrice,
                 payTypeName: detail.payTypeName,
                 elapsedSeconds: elapsed,
                 completedAt: Date()
             )
+            activeSnapshot = nil
+            stopErrorMessage = nil
             phase = .finished(receipt)
+            AppLog.shared.record(.info, module: .shower, "洗澡结算完成：隔间 \(receipt.goodsName) 实付 ¥\(receipt.realPrice) 用时 \(elapsed)s")
             await refreshAll()
         } catch {
-            phase = .failed(message: error.localizedDescription)
+            AppLog.shared.record(.error, module: .shower, "结算账单失败（orderNo=\(finalOrderNo)）：\(error.localizedDescription)")
+            // Keep running card with retry option if settle failed!
+            stopRequested = false
+            stopErrorMessage = "账单结算暂未成功：\(error.localizedDescription)。水控器停水后可稍等几秒点「立即结算」。"
+            phase = .running(
+                device: snapshot.device,
+                orderNo: snapshot.orderNo,
+                startedAt: snapshot.startedAt,
+                step: "等待账单结算",
+                appEndSupported: snapshot.appEndSupported,
+                stopping: false
+            )
+        }
+    }
+
+    private func upsertDevice(_ device: QiekjDevice) {
+        if let idx = devices.firstIndex(where: { $0.goodsId == device.goodsId }) {
+            devices[idx] = device
+        } else {
+            devices.insert(device, at: 0)
+        }
+        saveDevicesCache()
+    }
+
+    private func saveDevicesCache() {
+        if let encoded = try? JSONEncoder().encode(devices) {
+            UserDefaults.standard.set(encoded, forKey: Self.cachedDevicesKey)
+        }
+    }
+
+    private func persistActiveSnapshot() {
+        if let activeSnapshot, let data = try? JSONEncoder().encode(activeSnapshot) {
+            UserDefaults.standard.set(data, forKey: Self.activeSnapshotKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.activeSnapshotKey)
         }
     }
 }

@@ -8,6 +8,7 @@ struct ShowerTabView: View {
     @State private var onlyFavorites = false
     @State private var confirmStartDevice: QiekjDevice?
     @State private var showStopConfirm = false
+    @State private var showForceDismissConfirm = false
     @State private var showManualAdd = false
     @State private var manualGoodsId = ""
 
@@ -26,6 +27,13 @@ struct ShowerTabView: View {
         }
     }
 
+    private var isBusySession: Bool {
+        if case .idle = shower.phase { return false }
+        if case .finished = shower.phase { return false }
+        if case .failed = shower.phase { return false }
+        return true
+    }
+
     var body: some View {
         @Bindable var bindableShower = shower
 
@@ -33,25 +41,53 @@ struct ShowerTabView: View {
             ZStack {
                 LiquidBackdrop(style: .shower)
 
-                ScrollView {
-                    VStack(spacing: 16) {
-                        if !shower.isLoggedIn {
-                            loginPromptCard
-                        } else {
-                            accountMetricsBar(usePoints: $bindableShower.usePoints)
-                            activeSessionSection
-                            stallsSection
-                            if !shower.recentOrders.isEmpty {
-                                recentBillsSection
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(spacing: 16) {
+                            Color.clear.frame(height: 1).id("shower-top-anchor")
+
+                            if !shower.isLoggedIn {
+                                loginPromptCard
+                            } else {
+                                if let highlighted = shower.highlightedDevice {
+                                    highlightedScannedCard(device: highlighted)
+                                        .id("highlighted-stall")
+                                        .transition(.move(edge: .top).combined(with: .opacity))
+                                } else if let unmatchedSN = shower.unmatchedScanSN {
+                                    unmatchedSNBanner(sn: unmatchedSN)
+                                        .id("highlighted-stall")
+                                        .transition(.move(edge: .top).combined(with: .opacity))
+                                }
+
+                                accountMetricsBar(usePoints: $bindableShower.usePoints)
+                                activeSessionSection
+                                stallsSection
+                                if !shower.recentOrders.isEmpty {
+                                    recentBillsSection
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                        .padding(.bottom, 32)
+                    }
+                    .refreshable {
+                        await shower.refreshAll()
+                    }
+                    .onChange(of: shower.highlightedDevice?.goodsId) { _, newValue in
+                        if newValue != nil {
+                            withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+                                proxy.scrollTo("shower-top-anchor", anchor: .top)
                             }
                         }
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
-                    .padding(.bottom, 32)
-                }
-                .refreshable {
-                    await shower.refreshAll()
+                    .onChange(of: shower.unmatchedScanSN) { _, newValue in
+                        if newValue != nil {
+                            withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+                                proxy.scrollTo("shower-top-anchor", anchor: .top)
+                            }
+                        }
+                    }
                 }
             }
             .navigationTitle("胖乖洗澡")
@@ -102,11 +138,19 @@ struct ShowerTabView: View {
             }
             .alert("确认结束本次洗澡？", isPresented: $showStopConfirm) {
                 Button("继续洗", role: .cancel) {}
-                Button("停阀并结算", role: .destructive) {
+                Button("远程停阀并结算", role: .destructive) {
                     shower.requestStopShower()
                 }
             } message: {
-                Text("将向水控器下发远程停阀指令并生成本次结算账单。")
+                Text("将立即向水控器下发远程停阀指令并生成本次结算账单。")
+            }
+            .alert("关闭本地洗澡状态面板？", isPresented: $showForceDismissConfirm) {
+                Button("取消", role: .cancel) {}
+                Button("确认关闭", role: .destructive) {
+                    shower.forceDismissActiveSession()
+                }
+            } message: {
+                Text("仅关闭手机界面状态，请确认淋浴头已实际停水；账单稍后可在历史记录中查看。")
             }
             .alert("添加淋浴隔间", isPresented: $showManualAdd) {
                 TextField("输入 goodsId（例如 1101668384）", text: $manualGoodsId)
@@ -119,6 +163,98 @@ struct ShowerTabView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Highlighted Scanned Stall Spotlight
+
+    private func highlightedScannedCard(device: QiekjDevice) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("已定位当前扫码机器", systemImage: "scope")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.cyan)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .glassEffect(.regular.tint(.cyan), in: .capsule)
+
+                Spacer()
+
+                Button {
+                    withAnimation { shower.clearHighlight() }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
+            }
+
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("隔间 \(device.goodsName)")
+                    .font(.system(size: 32, weight: .bold, design: .rounded).monospacedDigit())
+
+                Text(device.statusLabel)
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(
+                        (device.isIdle ? Color.green : Color.orange).opacity(0.22),
+                        in: Capsule()
+                    )
+                    .foregroundStyle(device.isIdle ? .green : .orange)
+            }
+
+            let locationText = [device.parentPointName, device.orgName, "goodsId: \(device.goodsId)"]
+                .filter { !$0.isEmpty }
+                .joined(separator: " · ")
+            Text(locationText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Button {
+                confirmStartDevice = device
+            } label: {
+                Label("立即开启当前隔间出水", systemImage: "drop.fill")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+            }
+            .buttonStyle(.glassProminent)
+            .tint(.cyan)
+            .disabled(isBusySession)
+        }
+        .padding(18)
+        .glassEffect(.regular.tint(.cyan), in: .rect(cornerRadius: 28))
+        .overlay(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .strokeBorder(Color.cyan.opacity(0.65), lineWidth: 1.5)
+        )
+        .shadow(color: .cyan.opacity(0.25), radius: 16, y: 6)
+    }
+
+    private func unmatchedSNBanner(sn: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("已扫到胖乖设备码", systemImage: "qrcode.viewfinder")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.orange)
+                Spacer()
+                Button {
+                    withAnimation { shower.clearHighlight() }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text("SN = \(sn) 暂未匹配到具体隔间编号。请点击右上角刷新列表，或在「我的 → 运行日志」导出发我补齐该接口。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .glassEffect(.regular.tint(.orange), in: .rect(cornerRadius: 22))
     }
 
     private var loginPromptCard: some View {
@@ -208,7 +344,7 @@ struct ShowerTabView: View {
         case let .running(device, _, startedAt, step, appEndSupported, stopping):
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 let elapsed = max(0, Int(context.date.timeIntervalSince(startedAt)))
-                VStack(spacing: 16) {
+                VStack(spacing: 14) {
                     HStack {
                         Label("隔间 \(device.goodsName) · 出水中", systemImage: "drop.fill")
                             .font(.headline)
@@ -228,17 +364,48 @@ struct ShowerTabView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
 
+                    if let stopErr = shower.stopErrorMessage {
+                        Text(stopErr)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 8)
+                    }
+
                     Button {
                         showStopConfirm = true
                     } label: {
-                        Label(stopping ? "正在停阀结算…" : "结束洗澡并结算", systemImage: "stop.circle.fill")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
+                        Label(
+                            stopping ? "正在发送远程停阀…" : (shower.stopErrorMessage == nil ? "结束洗澡并结算" : "重试远程停阀"),
+                            systemImage: "stop.circle.fill"
+                        )
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
                     }
                     .buttonStyle(.glassProminent)
                     .tint(.red)
                     .disabled(stopping)
+
+                    HStack(spacing: 10) {
+                        Button {
+                            shower.forceSettleCurrentSession()
+                        } label: {
+                            Label("已在设备停水 · 立即结算", systemImage: "checkmark.circle")
+                                .font(.caption.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glass)
+                        .disabled(stopping)
+
+                        Button {
+                            showForceDismissConfirm = true
+                        } label: {
+                            Text("关闭")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(.glass)
+                    }
                 }
                 .padding(20)
                 .glassEffect(.regular.tint(.cyan), in: .rect(cornerRadius: 28))
@@ -326,7 +493,7 @@ struct ShowerTabView: View {
                         Button {
                             selectedTab = .scan
                         } label: {
-                            Label("扫码", systemImage: "qrcode.viewfinder")
+                            Label("扫码定位", systemImage: "qrcode.viewfinder")
                                 .font(.caption.weight(.semibold))
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
@@ -354,6 +521,7 @@ struct ShowerTabView: View {
                 LazyVStack(spacing: 10) {
                     ForEach(filteredDevices) { device in
                         stallRow(device: device)
+                            .id(device.goodsId)
                     }
                 }
             }
@@ -362,12 +530,7 @@ struct ShowerTabView: View {
 
     private func stallRow(device: QiekjDevice) -> some View {
         let isFav = shower.favoriteGoodsIDs.contains(device.goodsId)
-        let isBusySession: Bool = {
-            if case .idle = shower.phase { return false }
-            if case .finished = shower.phase { return false }
-            if case .failed = shower.phase { return false }
-            return true
-        }()
+        let isHighlighted = shower.highlightedDevice?.goodsId == device.goodsId
 
         return HStack(spacing: 12) {
             Button {
@@ -382,7 +545,7 @@ struct ShowerTabView: View {
             .glassEffect(.regular.interactive(), in: .circle)
 
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Text(device.goodsName)
                         .font(.title3.monospacedDigit().weight(.bold))
                     Text(device.statusLabel)
@@ -394,6 +557,14 @@ struct ShowerTabView: View {
                             in: Capsule()
                         )
                         .foregroundStyle(device.isIdle ? .green : .orange)
+                    if isHighlighted {
+                        Text("当前扫码")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.cyan.opacity(0.25), in: Capsule())
+                            .foregroundStyle(.cyan)
+                    }
                 }
 
                 let subtitle = [device.parentPointName, device.orgName]
@@ -414,12 +585,16 @@ struct ShowerTabView: View {
                     .font(.subheadline.weight(.semibold))
             }
             .buttonStyle(.glassProminent)
-            .tint(device.isIdle ? .cyan : .gray)
+            .tint(isHighlighted ? .cyan : (device.isIdle ? .cyan : .gray))
             .disabled(isBusySession)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        .glassEffect(.regular, in: .rect(cornerRadius: 22))
+        .glassEffect(isHighlighted ? .regular.tint(.cyan) : .regular, in: .rect(cornerRadius: 22))
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(isHighlighted ? Color.cyan.opacity(0.7) : Color.clear, lineWidth: 1.5)
+        )
     }
 
     private var recentBillsSection: some View {
