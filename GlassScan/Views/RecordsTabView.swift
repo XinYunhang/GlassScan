@@ -27,95 +27,94 @@ struct RecordsTabView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            ZStack(alignment: .bottom) {
-                Group {
-                    if records.isEmpty {
-                        ContentUnavailableView(
-                            "还没有采样记录",
-                            systemImage: "qrcode.viewfinder",
-                            description: Text("前往「扫码」页对准胖乖洗澡、U净洗衣机或吹风机二维码，扫描后会自动查询并保存数据。")
-                        )
-                    } else {
-                        List {
-                            Section {
-                                filterBar
-                                    .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
-                                    .listRowBackground(Color.clear)
-                            }
+        ZStack(alignment: .bottom) {
+            Group {
+                if records.isEmpty {
+                    ContentUnavailableView(
+                        "还没有采样记录",
+                        systemImage: "qrcode.viewfinder",
+                        description: Text("前往「扫码」页对准设备二维码，扫描后会自动查询并保存数据。")
+                    )
+                } else {
+                    List {
+                        Section {
+                            filterBar
+                                .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                                .listRowBackground(Color.clear)
+                        }
 
-                            Section("共 \(filteredRecords.count) 条采样（点击查看详情 / 左滑删除）") {
-                                ForEach(filteredRecords) { record in
-                                    NavigationLink {
-                                        RecordDetailView(record: record)
-                                    } label: {
-                                        RecordRowView(record: record)
-                                    }
+                        Section("共 \(filteredRecords.count) 条采样（点击查看详情 / 左滑删除）") {
+                            ForEach(filteredRecords) { record in
+                                NavigationLink {
+                                    RecordDetailView(record: record)
+                                } label: {
+                                    RecordRowView(record: record)
                                 }
-                                .onDelete(perform: deleteRecords)
                             }
+                            .onDelete(perform: deleteRecords)
                         }
-                        .listStyle(.insetGrouped)
+                    }
+                    .listStyle(.insetGrouped)
+                }
+            }
+
+            if let toastMessage {
+                Text(toastMessage)
+                    .font(.footnote.weight(.semibold))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .glassEffect(.regular, in: .capsule)
+                    .padding(.bottom, 16)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .navigationTitle("采样记录")
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $searchText, prompt: "搜索备注、域名或原文")
+        .toolbar {
+            if !filteredRecords.isEmpty {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        let json = ExportService.buildJSONString(
+                            records: filteredRecords,
+                            sanitize: coordinator.sanitizeExport
+                        )
+                        UIPasteboard.general.string = json
+                        showToast("已复制 \(filteredRecords.count) 条脱敏 JSON 到剪贴板")
+                    } label: {
+                        Label("复制 JSON", systemImage: "doc.on.doc")
                     }
                 }
 
-                if let toastMessage {
-                    Text(toastMessage)
-                        .font(.footnote.weight(.semibold))
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .glassEffect(.regular, in: .capsule)
-                        .padding(.bottom, 16)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                }
-            }
-            .navigationTitle("采样记录")
-            .searchable(text: $searchText, prompt: "搜索备注、域名或原文")
-            .toolbar {
-                if !filteredRecords.isEmpty {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            let json = ExportService.buildJSONString(
-                                records: filteredRecords,
-                                sanitize: coordinator.sanitizeExport
-                            )
-                            UIPasteboard.general.string = json
-                            showToast("已复制 \(filteredRecords.count) 条脱敏 JSON 到剪贴板")
-                        } label: {
-                            Label("复制 JSON", systemImage: "doc.on.doc")
-                        }
+                ToolbarItem(placement: .topBarTrailing) {
+                    ShareLink(
+                        item: ExportService.makeDocument(
+                            records: filteredRecords,
+                            sanitize: coordinator.sanitizeExport
+                        ),
+                        preview: SharePreview("GlassScan 采样数据 (\(filteredRecords.count) 条)")
+                    ) {
+                        Label("导出文件", systemImage: "square.and.arrow.up")
                     }
+                }
 
-                    ToolbarItem(placement: .topBarTrailing) {
-                        ShareLink(
-                            item: ExportService.makeDocument(
-                                records: filteredRecords,
-                                sanitize: coordinator.sanitizeExport
-                            ),
-                            preview: SharePreview("GlassScan 采样数据 (\(filteredRecords.count) 条)")
-                        ) {
-                            Label("导出文件", systemImage: "square.and.arrow.up")
-                        }
-                    }
-
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button(role: .destructive) {
-                            showDeleteAllConfirm = true
-                        } label: {
-                            Image(systemName: "trash")
-                        }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(role: .destructive) {
+                        showDeleteAllConfirm = true
+                    } label: {
+                        Image(systemName: "trash")
                     }
                 }
             }
-            .confirmationDialog("清空全部采样记录？", isPresented: $showDeleteAllConfirm, titleVisibility: .visible) {
-                Button("清空全部 (\(records.count) 条)", role: .destructive) {
-                    for item in records {
-                        modelContext.delete(item)
-                    }
-                    try? modelContext.save()
+        }
+        .confirmationDialog("清空全部采样记录？", isPresented: $showDeleteAllConfirm, titleVisibility: .visible) {
+            Button("清空全部 (\(records.count) 条)", role: .destructive) {
+                for item in records {
+                    modelContext.delete(item)
                 }
-                Button("取消", role: .cancel) {}
+                try? modelContext.save()
             }
+            Button("取消", role: .cancel) {}
         }
     }
 

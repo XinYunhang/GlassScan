@@ -5,16 +5,10 @@ struct AccountsTabView: View {
     @Binding var selectedTab: AppTabSelection
 
     @Environment(ProbeCoordinator.self) private var coordinator
+    @Environment(ShowerController.self) private var shower
+    @Environment(LaundryController.self) private var laundry
     @Environment(\.modelContext) private var modelContext
-
-    // Ujing state
-    @State private var ujingPhone = KeychainStore.read(.ujingPhone)
-    @State private var ujingCaptcha = ""
-    @State private var ujingTokenPreview = Sanitizer.maskTokenPreview(KeychainStore.read(.ujingToken))
-    @State private var ujingManualToken = ""
-    @State private var ujingStoreKeyword = ""
-    @State private var ujingCooldown = 0
-    @State private var ujingBusy = false
+    @Query(sort: \ScanRecord.createdAt, order: .reverse) private var records: [ScanRecord]
 
     // Qiekj state
     @State private var qiekjPhone = KeychainStore.read(.qiekjPhone)
@@ -23,6 +17,14 @@ struct AccountsTabView: View {
     @State private var qiekjManualToken = ""
     @State private var qiekjCooldown = 0
     @State private var qiekjBusy = false
+
+    // Ujing state
+    @State private var ujingPhone = KeychainStore.read(.ujingPhone)
+    @State private var ujingCaptcha = ""
+    @State private var ujingTokenPreview = Sanitizer.maskTokenPreview(KeychainStore.read(.ujingToken))
+    @State private var ujingManualToken = ""
+    @State private var ujingCooldown = 0
+    @State private var ujingBusy = false
 
     @State private var feedbackMessage: String?
 
@@ -39,68 +41,12 @@ struct AccountsTabView: View {
                     }
                 }
 
-                // MARK: - Ujing Account
+                // MARK: - Qiekj (Pangguai Shower)
                 Section {
-                    LabeledContent("当前 JWT", value: ujingTokenPreview)
-
-                    TextField("手机号", text: $ujingPhone)
-                        .keyboardType(.numberPad)
-
-                    HStack {
-                        TextField("短信验证码", text: $ujingCaptcha)
-                            .keyboardType(.numberPad)
-                        Button(ujingCooldown > 0 ? "\(ujingCooldown)s" : "发验证码") {
-                            sendUjingCaptcha()
-                        }
-                        .buttonStyle(.glass)
-                        .disabled(ujingBusy || ujingCooldown > 0 || ujingPhone.count < 11)
+                    LabeledContent("登录状态", value: qiekjTokenPreview)
+                    if let bal = shower.balance {
+                        LabeledContent("余额 / 积分", value: "¥\(bal.balance) · \(bal.integral) 积分")
                     }
-
-                    Button {
-                        loginUjing()
-                    } label: {
-                        Label("登录 U净（保存 JWT 至 Keychain）", systemImage: "key.fill")
-                    }
-                    .buttonStyle(.glassProminent)
-                    .disabled(ujingBusy || ujingPhone.count < 11 || ujingCaptcha.isEmpty)
-
-                    DisclosureGroup("或手动粘贴 U净 JWT") {
-                        TextField("粘贴 JWT（不含 Bearer）", text: $ujingManualToken)
-                            .font(.caption.monospaced())
-                        Button("保存 JWT") {
-                            KeychainStore.save(ujingManualToken, for: .ujingToken)
-                            ujingManualToken = ""
-                            refreshPreviews()
-                            feedbackMessage = "已保存 U净 JWT 到 Keychain"
-                        }
-                        .disabled(ujingManualToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-
-                    HStack {
-                        TextField("门店/楼栋关键字（如：13栋）", text: $ujingStoreKeyword)
-                        Button("抓看板") {
-                            probeUjingStores()
-                        }
-                        .buttonStyle(.glass)
-                        .disabled(ujingBusy || KeychainStore.read(.ujingToken).isEmpty)
-                    }
-
-                    if !KeychainStore.read(.ujingToken).isEmpty {
-                        Button("清除 U净登录态", role: .destructive) {
-                            KeychainStore.delete(.ujingToken)
-                            refreshPreviews()
-                            feedbackMessage = "已清除 U净 JWT"
-                        }
-                    }
-                } header: {
-                    Label("U净洗衣房 / 吹风机账号", systemImage: "washer.fill")
-                } footer: {
-                    Text("登录后，扫码将自动调用 scanWasherCode 与 program/info 保存完整设备/档位 JSON。")
-                }
-
-                // MARK: - Qiekj (Pangguai) Account
-                Section {
-                    LabeledContent("当前 Token", value: qiekjTokenPreview)
 
                     TextField("手机号", text: $qiekjPhone)
                         .keyboardType(.numberPad)
@@ -118,58 +64,128 @@ struct AccountsTabView: View {
                     Button {
                         loginQiekj()
                     } label: {
-                        Label("登录胖乖生活（保存 Token 至 Keychain）", systemImage: "drop.fill")
+                        Label("登录胖乖生活", systemImage: "drop.fill")
                     }
                     .buttonStyle(.glassProminent)
+                    .tint(.cyan)
                     .disabled(qiekjBusy || qiekjPhone.count < 11 || qiekjCode.isEmpty)
 
-                    DisclosureGroup("或手动粘贴胖乖 Token") {
+                    if shower.isLoggedIn {
+                        Button {
+                            dailySignInQiekj()
+                        } label: {
+                            Label("胖乖每日一键签到", systemImage: "sparkles")
+                        }
+                        .disabled(qiekjBusy)
+
+                        Button {
+                            syncQiekjSnapshot()
+                        } label: {
+                            Label("导出用：同步胖乖账单与设备样本", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(qiekjBusy)
+
+                        Button("退出胖乖账号", role: .destructive) {
+                            KeychainStore.delete(.qiekjToken)
+                            shower.balance = nil
+                            refreshPreviews()
+                            feedbackMessage = "已清除胖乖登录态"
+                        }
+                    }
+
+                    DisclosureGroup("手动粘贴胖乖 Token") {
                         TextField("粘贴胖乖 Token", text: $qiekjManualToken)
                             .font(.caption.monospaced())
                         Button("保存 Token") {
                             KeychainStore.save(qiekjManualToken, for: .qiekjToken)
                             qiekjManualToken = ""
                             refreshPreviews()
-                            feedbackMessage = "已保存胖乖 Token 到 Keychain"
+                            feedbackMessage = "已保存胖乖 Token"
+                            Task { await shower.refreshAll() }
                         }
                         .disabled(qiekjManualToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-
-                    Button {
-                        syncQiekjSnapshot()
-                    } label: {
-                        Label("一键同步胖乖历史订单 & 最近设备", systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .disabled(qiekjBusy || KeychainStore.read(.qiekjToken).isEmpty)
-
-                    if !KeychainStore.read(.qiekjToken).isEmpty {
-                        Button("清除胖乖登录态", role: .destructive) {
-                            KeychainStore.delete(.qiekjToken)
-                            refreshPreviews()
-                            feedbackMessage = "已清除胖乖 Token"
-                        }
-                    }
                 } header: {
-                    Label("胖乖生活账号", systemImage: "drop.fill")
-                } footer: {
-                    Text("一键同步可抓取你历史洗澡订单（order/list）和各类别最近使用设备（goods/latestUsed），直接保存为可导出样本。")
+                    Label("胖乖生活（洗澡）", systemImage: "drop.fill")
                 }
 
-                // MARK: - Probe & Export Settings
-                Section("自动探测与脱敏设置") {
+                // MARK: - Ujing (Laundry)
+                Section {
+                    LabeledContent("登录状态", value: ujingTokenPreview)
+
+                    TextField("手机号", text: $ujingPhone)
+                        .keyboardType(.numberPad)
+
+                    HStack {
+                        TextField("短信验证码", text: $ujingCaptcha)
+                            .keyboardType(.numberPad)
+                        Button(ujingCooldown > 0 ? "\(ujingCooldown)s" : "发验证码") {
+                            sendUjingCaptcha()
+                        }
+                        .buttonStyle(.glass)
+                        .disabled(ujingBusy || ujingCooldown > 0 || ujingPhone.count < 11)
+                    }
+
+                    Button {
+                        loginUjing()
+                    } label: {
+                        Label("登录 U净洗衣房", systemImage: "washer.fill")
+                    }
+                    .buttonStyle(.glassProminent)
+                    .tint(.indigo)
+                    .disabled(ujingBusy || ujingPhone.count < 11 || ujingCaptcha.isEmpty)
+
+                    if laundry.isLoggedIn {
+                        Button("退出 U净账号", role: .destructive) {
+                            KeychainStore.delete(.ujingToken)
+                            refreshPreviews()
+                            feedbackMessage = "已清除 U净登录态"
+                        }
+                    }
+
+                    DisclosureGroup("手动粘贴 U净 JWT") {
+                        TextField("粘贴 JWT（不含 Bearer）", text: $ujingManualToken)
+                            .font(.caption.monospaced())
+                        Button("保存 JWT") {
+                            KeychainStore.save(ujingManualToken, for: .ujingToken)
+                            ujingManualToken = ""
+                            refreshPreviews()
+                            feedbackMessage = "已保存 U净 JWT"
+                            Task { await laundry.refreshBoard() }
+                        }
+                        .disabled(ujingManualToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                } header: {
+                    Label("U净（洗衣机 / 烘干机）", systemImage: "washer.fill")
+                }
+
+                // MARK: - Debug Records & Settings
+                Section("采样调试与脱敏导出") {
+                    NavigationLink {
+                        RecordsTabView()
+                    } label: {
+                        LabeledContent {
+                            Text("\(records.count) 条")
+                                .foregroundStyle(.secondary)
+                        } label: {
+                            Label("采样记录与脱敏导出", systemImage: "tray.full.fill")
+                        }
+                    }
+
                     Toggle("扫码后自动 HTTP 只读探测", isOn: $bindableCoordinator.autoHTTPProbe)
-                    Toggle("已登 U净时自动调扫码识别接口", isOn: $bindableCoordinator.autoUjingProbe)
-                    Toggle("已登胖乖时自动查设备详情/SKU", isOn: $bindableCoordinator.autoQiekjProbe)
-                    Toggle("导出/复制时自动脱敏手机号与凭据", isOn: $bindableCoordinator.sanitizeExport)
+                    Toggle("导出时自动脱敏手机号与凭据", isOn: $bindableCoordinator.sanitizeExport)
                 }
 
                 Section {
-                    Text("所有凭据仅存储于本机 iOS Keychain（ThisDeviceOnly），不会进入任何日志；开启自动脱敏后，导出的 JSON 会自动将手机号、JWT、Token 等敏感字段替换为 ***。")
+                    Text("所有凭据仅保存于本机 iOS Keychain（ThisDeviceOnly），不会上传第三方服务器；支付宝付款走本机官方支付宝收银台，本 App 不经手任何资金。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("账号与探测")
+            .navigationTitle("我的账号")
+            .onAppear {
+                refreshPreviews()
+            }
         }
     }
 
@@ -177,8 +193,6 @@ struct AccountsTabView: View {
         ujingTokenPreview = Sanitizer.maskTokenPreview(KeychainStore.read(.ujingToken))
         qiekjTokenPreview = Sanitizer.maskTokenPreview(KeychainStore.read(.qiekjToken))
     }
-
-    // MARK: - Ujing Actions
 
     private func sendUjingCaptcha() {
         ujingBusy = true
@@ -207,38 +221,13 @@ struct AccountsTabView: View {
                 KeychainStore.save(token, for: .ujingToken)
                 ujingCaptcha = ""
                 refreshPreviews()
-                feedbackMessage = "U净登录成功！现在去扫码会自动查设备与档位。"
+                feedbackMessage = "U净登录成功！去「洗衣」页可添加宿舍洗衣房看板并扫码付款。"
+                await laundry.refreshBoard()
             } catch {
                 feedbackMessage = "U净登录失败：\(error.localizedDescription)"
             }
         }
     }
-
-    private func probeUjingStores() {
-        let token = KeychainStore.read(.ujingToken)
-        guard !token.isEmpty else { return }
-        ujingBusy = true
-        Task {
-            defer { ujingBusy = false }
-            let entry = await UjingClient.shared.probeStoresNear(
-                keyword: ujingStoreKeyword,
-                lat: 30.0,
-                lng: 114.0,
-                token: token
-            )
-            let title = ujingStoreKeyword.isEmpty ? "U净门店看板采样" : "U净门店看板 · \(ujingStoreKeyword)"
-            _ = coordinator.saveManualSnapshot(
-                platform: .ujing,
-                title: title,
-                probes: [entry],
-                context: modelContext
-            )
-            feedbackMessage = "已保存门店看板采样，前往「记录」页即可导出"
-            selectedTab = .records
-        }
-    }
-
-    // MARK: - Qiekj Actions
 
     private func sendQiekjCode() {
         qiekjBusy = true
@@ -267,9 +256,26 @@ struct AccountsTabView: View {
                 KeychainStore.save(token, for: .qiekjToken)
                 qiekjCode = ""
                 refreshPreviews()
-                feedbackMessage = "胖乖登录成功！建议顺手点一次「一键同步胖乖历史订单」。"
+                feedbackMessage = "胖乖登录成功！已自动同步你的洗澡隔间列表。"
+                await shower.refreshAll()
             } catch {
                 feedbackMessage = "胖乖登录失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func dailySignInQiekj() {
+        let token = KeychainStore.read(.qiekjToken)
+        guard !token.isEmpty else { return }
+        qiekjBusy = true
+        Task {
+            defer { qiekjBusy = false }
+            do {
+                let text = try await QiekjClient.shared.runDailySignIn(token: token)
+                feedbackMessage = text
+                await shower.refreshAll()
+            } catch {
+                feedbackMessage = "签到失败：\(error.localizedDescription)"
             }
         }
     }
@@ -287,8 +293,7 @@ struct AccountsTabView: View {
                 probes: entries,
                 context: modelContext
             )
-            feedbackMessage = "已保存 \(entries.count) 项胖乖接口样本，前往「记录」页即可导出"
-            selectedTab = .records
+            feedbackMessage = "已保存 \(entries.count) 项样本，点下方「采样记录与脱敏导出」即可分享"
         }
     }
 

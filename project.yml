@@ -22,18 +22,33 @@ targets:
       - path: GlassScan
         excludes:
           - "README.md"
+    info:
+      path: GlassScan/Info.plist
+      properties:
+        CFBundleDisplayName: GlassScan
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSCameraUsageDescription: "扫描胖乖洗澡与 U净洗衣设备二维码"
+        NSPhotoLibraryUsageDescription: "从相册选取二维码图片进行识别"
+        NSLocationWhenInUseUsageDescription: "用于搜索你附近的 U净洗衣房空闲看板"
+        LSApplicationQueriesSchemes:
+          - alipay
+          - alipays
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: com.xinyunhang.glassscan
+            CFBundleURLSchemes:
+              - glassscan
     settings:
       base:
         PRODUCT_NAME: GlassScan
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: GlassScan
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
-        INFOPLIST_KEY_NSCameraUsageDescription: "扫描设备二维码并自动记录解析与接口探测数据"
-        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "从相册选取二维码图片进行解析与探测"
-        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "2"
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: NO
     scheme:

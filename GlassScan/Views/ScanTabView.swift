@@ -7,11 +7,14 @@ struct ScanTabView: View {
     @Binding var selectedTab: AppTabSelection
 
     @Environment(ProbeCoordinator.self) private var coordinator
+    @Environment(ShowerController.self) private var shower
+    @Environment(LaundryController.self) private var laundry
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \ScanRecord.createdAt, order: .reverse) private var records: [ScanRecord]
 
     @State private var isTorchOn = false
     @State private var isScanningEnabled = true
+    @State private var businessMode = true
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var latestRecord: ScanRecord?
     @State private var presentingRecord: ScanRecord?
@@ -22,8 +25,9 @@ struct ScanTabView: View {
     @Namespace private var glassNS
 
     var body: some View {
+        @Bindable var bindableLaundry = laundry
+
         ZStack {
-            // Full-bleed live camera feed gives true iOS 26 Liquid Glass optical refraction
             CameraScannerView(
                 isTorchOn: $isTorchOn,
                 isScanningEnabled: $isScanningEnabled
@@ -32,11 +36,9 @@ struct ScanTabView: View {
             }
             .ignoresSafeArea()
 
-            // Subtle corner reticle overlay
-            ScanReticleOverlay(isProbing: coordinator.isProbing)
+            ScanReticleOverlay(isProbing: coordinator.isProbing || laundry.isWorking)
                 .allowsHitTesting(false)
 
-            // Floating Liquid Glass chrome over the live optical backdrop
             VStack(spacing: 14) {
                 topStatusBar
                 Spacer()
@@ -59,6 +61,14 @@ struct ScanTabView: View {
             .padding(.top, 12)
             .padding(.bottom, 22)
         }
+        .sheet(item: $bindableLaundry.preparedSession, onDismiss: {
+            isScanningEnabled = true
+        }) { session in
+            UjingOrderSheet(session: session) {
+                latestRecord = nil
+                selectedTab = .laundry
+            }
+        }
         .sheet(item: $presentingRecord, onDismiss: {
             isScanningEnabled = true
         }) { record in
@@ -79,7 +89,7 @@ struct ScanTabView: View {
         .alert("输入或粘贴二维码原文", isPresented: $showManualInput) {
             TextField("粘贴链接或设备码", text: $manualText)
             Button("取消", role: .cancel) { manualText = "" }
-            Button("探测并保存") {
+            Button("立即识别") {
                 let text = manualText.trimmingCharacters(in: .whitespacesAndNewlines)
                 manualText = ""
                 if !text.isEmpty {
@@ -105,16 +115,20 @@ struct ScanTabView: View {
         GlassEffectContainer(spacing: 10) {
             HStack(spacing: 10) {
                 HStack(spacing: 8) {
-                    if coordinator.isProbing {
+                    if coordinator.isProbing || laundry.isWorking {
                         ProgressView()
                             .controlSize(.small)
                     } else {
                         Image(systemName: isScanningEnabled ? "viewfinder" : "pause.circle.fill")
                             .font(.subheadline.weight(.semibold))
                     }
-                    Text(coordinator.isProbing ? "自动查询接口中…" : coordinator.statusBanner)
-                        .font(.subheadline.weight(.medium))
-                        .lineLimit(1)
+                    Text(
+                        (coordinator.isProbing || laundry.isWorking)
+                            ? "正在识别设备…"
+                            : (businessMode ? "扫 U净洗衣 / 胖乖洗澡" : "采样探测模式")
+                    )
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
@@ -124,20 +138,22 @@ struct ScanTabView: View {
                 Spacer(minLength: 4)
 
                 Button {
-                    selectedTab = .records
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: "tray.full.fill")
-                            .font(.caption.weight(.semibold))
-                        Text("\(records.count)")
-                            .font(.subheadline.monospacedDigit().weight(.semibold))
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        businessMode.toggle()
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
+                    showToast(businessMode ? "已切回：业务直达模式" : "已切到：纯采样调试模式")
+                } label: {
+                    Label(businessMode ? "业务" : "采样", systemImage: businessMode ? "bolt.fill" : "waveform.path.ecg")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: .capsule)
-                .glassEffectID("scan-count-pill", in: glassNS)
+                .glassEffect(
+                    businessMode ? .regular.tint(.blue).interactive() : .regular.tint(.orange).interactive(),
+                    in: .capsule
+                )
+                .glassEffectID("scan-mode-pill", in: glassNS)
             }
         }
     }
@@ -177,30 +193,40 @@ struct ScanTabView: View {
                     .glassEffect(.regular.interactive(), in: .circle)
                 }
 
-                // Quick one-tap labels for bathroom / laundry room
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(["胖乖洗澡", "U净洗衣机", "U净烘干机", "U净吹风机"], id: \.self) { label in
-                            Button(label) {
-                                record.note = label
-                                try? modelContext.save()
-                                showToast("已标记为「\(label)」")
-                            }
-                            .font(.caption.weight(.medium))
-                            .buttonStyle(.glass)
-                            .controlSize(.small)
-                        }
-                    }
-                }
-
                 HStack(spacing: 10) {
+                    if record.platform == .ujing {
+                        Button {
+                            Task {
+                                let ok = await laundry.prepareFromQRCode(record.rawText)
+                                if !ok, let err = laundry.lastError {
+                                    showToast(err)
+                                }
+                            }
+                        } label: {
+                            Label("进入下单", systemImage: "washer.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(.indigo)
+                    } else if record.platform == .pangguai {
+                        Button {
+                            latestRecord = nil
+                            isScanningEnabled = true
+                            selectedTab = .shower
+                        } label: {
+                            Label("去洗澡页开阀", systemImage: "drop.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(.cyan)
+                    }
+
                     Button {
                         presentingRecord = record
                     } label: {
-                        Label("查看查询数据 (\(record.probes.count))", systemImage: "doc.text.magnifyingglass")
-                            .frame(maxWidth: .infinity)
+                        Label("详情", systemImage: "doc.text.magnifyingglass")
                     }
-                    .buttonStyle(.glassProminent)
+                    .buttonStyle(.glass)
 
                     Button {
                         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
@@ -208,7 +234,7 @@ struct ScanTabView: View {
                             isScanningEnabled = true
                         }
                     } label: {
-                        Label("继续扫", systemImage: "qrcode.viewfinder")
+                        Image(systemName: "qrcode.viewfinder")
                     }
                     .buttonStyle(.glass)
                 }
@@ -222,7 +248,6 @@ struct ScanTabView: View {
     private var bottomLiquidDock: some View {
         GlassEffectContainer(spacing: 14) {
             HStack(spacing: 14) {
-                // Torch toggle
                 Button {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
                         isTorchOn.toggle()
@@ -240,7 +265,6 @@ struct ScanTabView: View {
                 .glassEffectID("dock-torch", in: glassNS)
                 .accessibilityLabel("手电筒")
 
-                // Photo library QR decode
                 PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
                     Image(systemName: "photo.on.rectangle.angled")
                         .font(.title3.weight(.semibold))
@@ -251,7 +275,6 @@ struct ScanTabView: View {
                 .glassEffectID("dock-photo", in: glassNS)
                 .accessibilityLabel("从相册识码")
 
-                // Paste from clipboard or manual input
                 Button {
                     if let pasted = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
                        !pasted.isEmpty {
@@ -268,7 +291,6 @@ struct ScanTabView: View {
                 .glassEffect(.regular.interactive(), in: .capsule)
                 .glassEffectID("dock-paste", in: glassNS)
 
-                // Pause / Resume scan
                 Button {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
                         isScanningEnabled.toggle()
@@ -294,7 +316,35 @@ struct ScanTabView: View {
 
     private func triggerScan(rawText: String, symbology: String, source: ScanSource) {
         isScanningEnabled = false
+        let analysis = QRAnalyzer.analyze(rawText: rawText, existingRecords: records)
+
         Task {
+            // In business mode, route Ujing washer/dryer directly into the order & payment sheet
+            if businessMode && analysis.platform == .ujing && laundry.isLoggedIn {
+                let openedOrderSheet = await laundry.prepareFromQRCode(rawText)
+                if openedOrderSheet {
+                    // Record scan asynchronously without blocking the order sheet
+                    _ = await coordinator.handleScannedCode(
+                        rawText: rawText,
+                        symbology: symbology,
+                        source: source,
+                        context: modelContext,
+                        existingRecords: records
+                    )
+                    return
+                } else if let err = laundry.lastError {
+                    showToast(err)
+                }
+            }
+
+            // In business mode, if Pangguai QR contains goodsId, auto-add to shower list
+            if businessMode && analysis.platform == .pangguai && shower.isLoggedIn {
+                if let gid = analysis.candidateGoodsId {
+                    _ = await shower.addDeviceByGoodsId(gid)
+                    showToast("已识别胖乖隔间并加入洗澡列表")
+                }
+            }
+
             let record = await coordinator.handleScannedCode(
                 rawText: rawText,
                 symbology: symbology,
@@ -313,7 +363,7 @@ struct ScanTabView: View {
             toastMessage = message
         }
         Task {
-            try? await Task.sleep(for: .seconds(2.2))
+            try? await Task.sleep(for: .seconds(2.4))
             withAnimation(.easeInOut(duration: 0.25)) {
                 if toastMessage == message {
                     toastMessage = nil
@@ -325,8 +375,8 @@ struct ScanTabView: View {
     private func platformTint(_ platform: ScanPlatform) -> Color {
         switch platform {
         case .pangguai: return .cyan
-        case .ujing: return .blue
-        case .alipay: return .indigo
+        case .ujing: return .indigo
+        case .alipay: return .blue
         case .wechat: return .green
         case .web: return .orange
         case .text: return .gray
