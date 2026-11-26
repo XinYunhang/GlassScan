@@ -382,6 +382,56 @@ struct FavoriteUjingStore: Codable, Equatable, Identifiable, Sendable {
     let lng: Double
 }
 
+struct SavedUjingDevice: Codable, Equatable, Identifiable, Sendable {
+    let deviceId: String
+    let rawQRCode: String
+    var deviceNo: String
+    var deviceTypeId: Int
+    var deviceTypeName: String
+    var storeId: String
+    var storeName: String
+    var moduleType: Int
+    var customAlias: String
+    var savedAt: Date
+    var lastCreateOrderEnabled: Bool?
+    var lastStatus: String
+    var lastReason: String
+    var lastCheckedAt: Date?
+
+    var id: String { deviceId }
+
+    var isDryer: Bool {
+        deviceTypeId == 3 || deviceTypeName.contains("烘干") || deviceTypeName.contains("干衣")
+    }
+
+    var displayName: String {
+        let trimmed = customAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        let composed = [deviceTypeName, deviceNo].filter { !$0.isEmpty }.joined(separator: " ")
+        return composed.isEmpty ? "U净机器 \(String(deviceId.suffix(4)))" : composed
+    }
+
+    var subtitle: String {
+        let trimmedAlias = customAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedAlias.isEmpty {
+            let parts = [storeName, deviceNo].filter { !$0.isEmpty }
+            return parts.isEmpty ? deviceTypeName : parts.joined(separator: " · ")
+        }
+        return storeName.isEmpty ? "已保存固定二维码" : storeName
+    }
+
+    var statusBadgeText: String {
+        guard let enabled = lastCreateOrderEnabled else { return "点刷新查状态" }
+        if enabled { return "空闲可锁机" }
+        if lastStatus == "8" || lastReason.contains("离线") { return "离线" }
+        if lastStatus == "2" || lastReason.contains("故障") { return "故障" }
+        return "使用中"
+    }
+
+    var isKnownIdle: Bool { lastCreateOrderEnabled == true }
+    var isKnownBusy: Bool { lastCreateOrderEnabled == false }
+}
+
 enum PriceFormatter {
     static func fenToYuan(_ fen: Int) -> String {
         let sign = fen < 0 ? "-" : ""

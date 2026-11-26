@@ -17,11 +17,15 @@ final class LaundryController {
     var favoriteStores: [FavoriteUjingStore] = [] {
         didSet { persistFavorites() }
     }
+    var savedDevices: [SavedUjingDevice] = [] {
+        didSet { persistSavedDevices() }
+    }
     var boardRows: [UjingStoreBoardItem] = []
     var searchResults: [UjingStoreBoardItem] = []
 
     var preparedSession: PreparedUjingSession?
     var isRefreshingBoard = false
+    var isRefreshingSavedDevices = false
     var isSearchingStores = false
     var isWorking = false
     var noticeText: String?
@@ -29,6 +33,7 @@ final class LaundryController {
 
     private static let activeOrderKey = "ujing_active_order_v1"
     private static let favoritesKey = "ujing_favorite_stores_v1"
+    private static let savedDevicesKey = "ujing_saved_devices_v1"
 
     var isLoggedIn: Bool {
         !KeychainStore.read(.ujingToken).isEmpty
@@ -42,6 +47,10 @@ final class LaundryController {
         if let data = UserDefaults.standard.data(forKey: Self.favoritesKey),
            let saved = try? JSONDecoder().decode([FavoriteUjingStore].self, from: data) {
             self.favoriteStores = saved
+        }
+        if let data = UserDefaults.standard.data(forKey: Self.savedDevicesKey),
+           let saved = try? JSONDecoder().decode([SavedUjingDevice].self, from: data) {
+            self.savedDevices = saved
         }
     }
 
@@ -129,6 +138,117 @@ final class LaundryController {
         }
     }
 
+    // MARK: - Saved Washers (Remote Lock & Pay)
+
+    @discardableResult
+    func upsertSavedDevice(scanInfo: UjingScanInfo, programInfo: UjingProgramInfo?) -> SavedUjingDevice {
+        let existing = savedDevices.first(where: { $0.deviceId == scanInfo.deviceId })
+        let updated = SavedUjingDevice(
+            deviceId: scanInfo.deviceId,
+            rawQRCode: scanInfo.rawQRCode,
+            deviceNo: programInfo?.deviceNo.isEmpty == false ? (programInfo?.deviceNo ?? "") : (existing?.deviceNo ?? ""),
+            deviceTypeId: programInfo?.deviceTypeId ?? (scanInfo.deviceTypeId != 0 ? scanInfo.deviceTypeId : (existing?.deviceTypeId ?? 0)),
+            deviceTypeName: programInfo?.deviceTypeName.isEmpty == false ? (programInfo?.deviceTypeName ?? "洗衣机") : (existing?.deviceTypeName ?? "洗衣机"),
+            storeId: programInfo?.storeId.isEmpty == false ? (programInfo?.storeId ?? "") : (existing?.storeId ?? ""),
+            storeName: programInfo?.storeName.isEmpty == false ? (programInfo?.storeName ?? "") : (existing?.storeName ?? ""),
+            moduleType: scanInfo.moduleType >= 0 ? scanInfo.moduleType : (existing?.moduleType ?? -1),
+            customAlias: existing?.customAlias ?? "",
+            savedAt: existing?.savedAt ?? Date(),
+            lastCreateOrderEnabled: scanInfo.createOrderEnabled,
+            lastStatus: scanInfo.status,
+            lastReason: scanInfo.reason,
+            lastCheckedAt: Date()
+        )
+        if let idx = savedDevices.firstIndex(where: { $0.deviceId == updated.deviceId }) {
+            savedDevices[idx] = updated
+        } else {
+            savedDevices.append(updated)
+            AppLog.shared.record(.info, module: .laundry, "已收录常驻洗衣机：\(updated.displayName) (\(updated.storeName))")
+        }
+        return updated
+    }
+
+    func saveWasherFromQRCode(_ rawQRCode: String) async -> SavedUjingDevice? {
+        let token = KeychainStore.read(.ujingToken)
+        guard !token.isEmpty else {
+            lastError = "保存洗衣机前请先在「我的」页登录 U净"
+            return nil
+        }
+        do {
+            let scanInfo = try await UjingClient.shared.scanWasher(token: token, qrCode: rawQRCode)
+            guard !scanInfo.deviceId.isEmpty else {
+                let reason = scanInfo.reason.isEmpty ? "该二维码不是有效的 U净洗衣机" : scanInfo.reason
+                lastError = reason
+                return nil
+            }
+            let program = try? await UjingClient.shared.fetchProgramInfo(token: token, deviceId: scanInfo.deviceId)
+            return upsertSavedDevice(scanInfo: scanInfo, programInfo: program)
+        } catch {
+            lastError = "识别并保存洗衣机失败：\(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    func refreshSavedDevicesStatus() async {
+        let token = KeychainStore.read(.ujingToken)
+        guard !token.isEmpty, !savedDevices.isEmpty, !isRefreshingSavedDevices else { return }
+
+        isRefreshingSavedDevices = true
+        defer { isRefreshingSavedDevices = false }
+
+        var idleCount = 0
+        let snapshot = savedDevices
+        for dev in snapshot {
+            if let scanInfo = try? await UjingClient.shared.scanWasher(token: token, qrCode: dev.rawQRCode),
+               !scanInfo.deviceId.isEmpty {
+                var updated = dev
+                updated.lastCreateOrderEnabled = scanInfo.createOrderEnabled
+                updated.lastStatus = scanInfo.status
+                updated.lastReason = scanInfo.reason
+                updated.lastCheckedAt = Date()
+                if scanInfo.moduleType >= 0 { updated.moduleType = scanInfo.moduleType }
+                if let idx = savedDevices.firstIndex(where: { $0.deviceId == dev.deviceId }) {
+                    savedDevices[idx] = updated
+                }
+                if scanInfo.createOrderEnabled { idleCount += 1 }
+            }
+        }
+        AppLog.shared.record(.info, module: .laundry, "已刷新 \(snapshot.count) 台常驻洗衣机状态：空闲 \(idleCount) 台")
+    }
+
+    func prepareFromSavedDevice(_ device: SavedUjingDevice) async -> Bool {
+        await prepareFromQRCode(device.rawQRCode)
+    }
+
+    func renameSavedDevice(id: String, alias: String) {
+        guard let idx = savedDevices.firstIndex(where: { $0.deviceId == id }) else { return }
+        savedDevices[idx].customAlias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func removeSavedDevice(id: String) {
+        savedDevices.removeAll { $0.deviceId == id }
+    }
+
+    func importSavedDevices(from rawTexts: [String]) async -> Int {
+        let token = KeychainStore.read(.ujingToken)
+        guard !token.isEmpty else { return 0 }
+        let existingQRs = Set(savedDevices.map(\.rawQRCode))
+        let uniqueCandidates = Array(Set(rawTexts)).filter { raw in
+            let lower = raw.lowercased()
+            return (lower.contains("ujing") || lower.contains("midea")) && !existingQRs.contains(raw)
+        }
+        var imported = 0
+        for raw in uniqueCandidates {
+            if await saveWasherFromQRCode(raw) != nil {
+                imported += 1
+            }
+        }
+        if imported > 0 {
+            noticeText = "已从历史扫码记录导入 \(imported) 台常驻洗衣机"
+        }
+        return imported
+    }
+
     // MARK: - Scan → Program → Create → Pay → Start
 
     func prepareFromQRCode(_ rawQRCode: String) async -> Bool {
@@ -151,6 +271,8 @@ final class LaundryController {
             }
 
             let program = try await UjingClient.shared.fetchProgramInfo(token: token, deviceId: scanInfo.deviceId)
+            // Always auto-save the fixed washer QR code so user can remotely check & lock it later!
+            _ = upsertSavedDevice(scanInfo: scanInfo, programInfo: program)
             preparedSession = PreparedUjingSession(scanInfo: scanInfo, programInfo: program)
             return true
         } catch {
@@ -358,6 +480,12 @@ final class LaundryController {
     private func persistFavorites() {
         if let data = try? JSONEncoder().encode(favoriteStores) {
             UserDefaults.standard.set(data, forKey: Self.favoritesKey)
+        }
+    }
+
+    private func persistSavedDevices() {
+        if let data = try? JSONEncoder().encode(savedDevices) {
+            UserDefaults.standard.set(data, forKey: Self.savedDevicesKey)
         }
     }
 }

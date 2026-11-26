@@ -11,7 +11,7 @@ actor QiekjClient {
     static let shared = QiekjClient()
 
     private let baseURL = "https://userapi.qiekj.com"
-    private let apiVersion = "1.60.3"
+    private let apiVersion = "1.145.0"
     private let pointsVersion = "1.123.0"
     private let channel = "android_app"
     private let appSecret = "nFU9pbG8YQoAe1kFh+E7eyrdlSLglwEJeA0wwHB1j5o="
@@ -242,9 +242,9 @@ actor QiekjClient {
     func scanBySN(token: String, sn: String, rawQRCode: String) async -> String? {
         let attempts: [[(String, String)]] = [
             [("SN", sn), ("token", token)],
-            [("sn", sn), ("token", token)],
+            [("IMEI", sn), ("token", token)],
             [("NQT", rawQRCode), ("token", token)],
-            [("imei", sn), ("token", token)]
+            [("sn", sn), ("token", token)]
         ]
         for form in attempts {
             let outcome = await postForm(
@@ -321,15 +321,31 @@ actor QiekjClient {
         try requireSuccess(outcome)
     }
 
-    func unlockWater(token: String, skuId: String, usePoints: Bool) async throws -> String {
+    func unlockWater(
+        token: String,
+        skuId: String,
+        usePoints: Bool,
+        categoryCode: String = "08",
+        imei: String = ""
+    ) async throws -> String {
         let promo = usePoints ? promotionsWithPoints : promotionsWithoutPoints
+        var extraHeaders: [(String, String)] = []
+        if !categoryCode.isEmpty { extraHeaders.append(("categoryCode", categoryCode)) }
+        if !imei.isEmpty { extraHeaders.append(("imei", imei)) }
+
         let outcome = await postForm(
             probeType: "qiekj_unlock",
             title: "云端开阀出水",
             path: "/goods/water/unlock",
             token: token,
-            form: [("skuId", skuId), ("promotions", promo), ("token", token)],
-            isLoginAPI: false
+            form: [
+                ("skuId", skuId),
+                ("promotions", promo),
+                ("payType", "15"),
+                ("token", token)
+            ],
+            isLoginAPI: false,
+            extraHeaders: extraHeaders
         )
         try requireSuccess(outcome)
         let data = outcome.jsonObject?["data"] as? [String: Any] ?? [:]
@@ -351,7 +367,7 @@ actor QiekjClient {
         try requireSuccess(outcome)
     }
 
-    func createAfterPay(token: String, orderNo: String) async throws -> String {
+    func createAfterPay(token: String, orderNo: String) async throws -> (orderId: String, orderNo: String, orderStatus: Int) {
         let outcome = await postForm(
             probeType: "qiekj_create_afterpay",
             title: "创建后付结算单",
@@ -365,7 +381,26 @@ actor QiekjClient {
         guard let orderId = stringValue(data["orderId"]), !orderId.isEmpty else {
             throw QiekjClientError(code: -1, message: "未返回结算 orderId")
         }
-        return orderId
+        let realOrderNo = stringValue(data["orderNo"]) ?? orderNo
+        let status = intValue(data["orderStatus"]) ?? 0
+        return (orderId, realOrderNo, status)
+    }
+
+    func orderSync(token: String, orderNo: String, payType: String = "15") async -> Bool {
+        let outcome = await postForm(
+            probeType: "qiekj_order_sync",
+            title: "同步后付扣款状态",
+            path: "/order/sync",
+            token: token,
+            form: [("orderNo", orderNo), ("payType", payType), ("token", token)],
+            isLoginAPI: false
+        )
+        if !outcome.entry.success { return false }
+        if let data = outcome.jsonObject?["data"] as? [String: Any],
+           let code = stringValue(data["code"]) {
+            return code == "0"
+        }
+        return true
     }
 
     func fetchOrderDetail(token: String, orderId: String) async throws -> (realPrice: String, originPrice: String, payTypeName: String) {
@@ -536,7 +571,8 @@ actor QiekjClient {
         form: [(String, String)],
         isLoginAPI: Bool,
         versionOverride: String? = nil,
-        signPathSeparator: String = ""
+        signPathSeparator: String = "&",
+        extraHeaders: [(String, String)] = []
     ) async -> RequestOutcome {
         let started = Date()
         let fullURLString = "\(baseURL)\(path)"
@@ -578,6 +614,9 @@ actor QiekjClient {
                 let hex = digest.map { String(format: "%02x", $0) }.joined()
                 request.setValue(hex, forHTTPHeaderField: "sign")
             }
+        }
+        for (hKey, hValue) in extraHeaders where !hKey.isEmpty && !hValue.isEmpty {
+            request.setValue(hValue, forHTTPHeaderField: hKey)
         }
 
         let bodyString = form.map { key, value in

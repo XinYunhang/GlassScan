@@ -1,14 +1,27 @@
+import SwiftData
 import SwiftUI
 
 struct LaundryTabView: View {
     @Binding var selectedTab: AppTabSelection
 
     @Environment(LaundryController.self) private var laundry
+    @Query(sort: \ScanRecord.createdAt, order: .reverse) private var scanRecords: [ScanRecord]
     @State private var showStoreSearch = false
     @State private var searchKeyword = ""
     @State private var showCancelConfirm = false
+    @State private var renamingDevice: SavedUjingDevice?
+    @State private var aliasDraft = ""
 
     @Namespace private var glassNS
+
+    private var hasImportableUjingRecords: Bool {
+        let savedQRs = Set(laundry.savedDevices.map(\.rawQRCode))
+        return scanRecords.contains { rec in
+            let lower = rec.rawText.lowercased()
+            return (rec.platform == .ujing || lower.contains("ujing") || lower.contains("midea"))
+                && !savedQRs.contains(rec.rawText)
+        }
+    }
 
     var body: some View {
         @Bindable var bindableLaundry = laundry
@@ -32,6 +45,7 @@ struct LaundryTabView: View {
                                 activeOrderHeroCard(order: order)
                             }
 
+                            savedDevicesSection
                             quickScanCard(hasActiveOrder: laundry.activeOrder != nil && laundry.activeOrder?.isTerminal == false)
                             boardSection
                         }
@@ -42,6 +56,7 @@ struct LaundryTabView: View {
                 }
                 .refreshable {
                     await laundry.refreshActiveOrder()
+                    await laundry.refreshSavedDevicesStatus()
                     await laundry.refreshBoard()
                 }
             }
@@ -60,10 +75,11 @@ struct LaundryTabView: View {
                         Button {
                             Task {
                                 await laundry.refreshActiveOrder()
+                                await laundry.refreshSavedDevicesStatus()
                                 await laundry.refreshBoard()
                             }
                         } label: {
-                            if laundry.isRefreshingBoard {
+                            if laundry.isRefreshingBoard || laundry.isRefreshingSavedDevices {
                                 ProgressView()
                             } else {
                                 Image(systemName: "arrow.clockwise")
@@ -75,6 +91,9 @@ struct LaundryTabView: View {
             .task {
                 if laundry.isLoggedIn {
                     await laundry.refreshActiveOrder()
+                    if !laundry.savedDevices.isEmpty {
+                        await laundry.refreshSavedDevicesStatus()
+                    }
                     if laundry.boardRows.isEmpty && !laundry.favoriteStores.isEmpty {
                         await laundry.refreshBoard()
                     }
@@ -104,6 +123,23 @@ struct LaundryTabView: View {
                 }
             } message: {
                 Text("取消后会立即释放 2 分钟机器锁定，他人可正常使用。")
+            }
+            .alert(
+                "自定义洗衣机备注名",
+                isPresented: Binding(
+                    get: { renamingDevice != nil },
+                    set: { if !$0 { renamingDevice = nil } }
+                ),
+                presenting: renamingDevice
+            ) { device in
+                TextField("例如：9楼4层 左边1号机", text: $aliasDraft)
+                Button("取消", role: .cancel) { renamingDevice = nil }
+                Button("保存") {
+                    laundry.renameSavedDevice(id: device.deviceId, alias: aliasDraft)
+                    renamingDevice = nil
+                }
+            } message: { device in
+                Text("给这台固定二维码机器起个好认的名字，方便在宿舍远程锁机。")
             }
         }
     }
@@ -269,6 +305,175 @@ struct LaundryTabView: View {
             )
             .glassEffectID("ujing-active-order", in: glassNS)
         }
+    }
+
+    // MARK: - Saved Washers (Remote Lock & Pay)
+
+    private var savedDevicesSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("已保存洗衣机 · 远程锁机 (\(laundry.savedDevices.count))")
+                        .font(.headline)
+                    if !laundry.savedDevices.isEmpty {
+                        let idleCount = laundry.savedDevices.filter(\.isKnownIdle).count
+                        Text("空闲 \(idleCount) 台 · 在宿舍即可先下单锁机 2 分钟并付款")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if !laundry.savedDevices.isEmpty {
+                    Button {
+                        Task { await laundry.refreshSavedDevicesStatus() }
+                    } label: {
+                        Label(laundry.isRefreshingSavedDevices ? "查询中" : "查空闲", systemImage: "arrow.clockwise")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(laundry.isRefreshingSavedDevices)
+                }
+            }
+
+            if laundry.savedDevices.isEmpty {
+                VStack(spacing: 10) {
+                    Text("扫码一次即可永久保存洗衣机固定码")
+                        .font(.subheadline.weight(.semibold))
+                    Text("去洗衣房把常用机器的二维码各扫一遍（哪怕当时正在使用中也会自动保存）。以后看到空闲，在宿舍直接远程锁机付款，不怕被别人抢先占机。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    HStack(spacing: 10) {
+                        Button {
+                            selectedTab = .scan
+                        } label: {
+                            Label("去扫码收录", systemImage: "qrcode.viewfinder")
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(.indigo)
+
+                        if hasImportableUjingRecords {
+                            Button {
+                                Task {
+                                    let rawTexts = scanRecords.map(\.rawText)
+                                    _ = await laundry.importSavedDevices(from: rawTexts)
+                                }
+                            } label: {
+                                Label("从历史导入", systemImage: "tray.and.arrow.down")
+                            }
+                            .buttonStyle(.glass)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(18)
+                .glassEffect(.regular, in: .rect(cornerRadius: 24))
+            } else {
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                    ForEach(laundry.savedDevices) { dev in
+                        savedDeviceCard(device: dev)
+                    }
+                }
+
+                if hasImportableUjingRecords {
+                    Button {
+                        Task {
+                            let rawTexts = scanRecords.map(\.rawText)
+                            _ = await laundry.importSavedDevices(from: rawTexts)
+                        }
+                    } label: {
+                        Label("发现历史扫码记录中有未收录的 U净机器，点此一键导入", systemImage: "tray.and.arrow.down")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.glass)
+                }
+            }
+        }
+    }
+
+    private func savedDeviceCard(device: SavedUjingDevice) -> some View {
+        let badgeColor: Color = device.isKnownIdle ? .green : (device.isKnownBusy ? .orange : .secondary)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 6) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(device.displayName)
+                        .font(.subheadline.weight(.bold))
+                        .lineLimit(2)
+                    Text(device.subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 2)
+                Menu {
+                    Button {
+                        aliasDraft = device.customAlias.isEmpty ? device.displayName : device.customAlias
+                        renamingDevice = device
+                    } label: {
+                        Label("自定义备注名", systemImage: "pencil")
+                    }
+                    Button(role: .destructive) {
+                        laundry.removeSavedDevice(id: device.deviceId)
+                    } label: {
+                        Label("删除该机器", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                }
+            }
+
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(badgeColor)
+                    .frame(width: 7, height: 7)
+                Text(device.statusBadgeText)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(badgeColor)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(badgeColor.opacity(0.15), in: Capsule())
+
+            if device.isKnownIdle {
+                Button {
+                    Task { _ = await laundry.prepareFromSavedDevice(device) }
+                } label: {
+                    Label("远程锁机下单", systemImage: "lock.fill")
+                        .font(.caption.weight(.bold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glassProminent)
+                .tint(.indigo)
+                .controlSize(.small)
+                .disabled(laundry.isWorking)
+            } else {
+                Button {
+                    Task { _ = await laundry.prepareFromSavedDevice(device) }
+                } label: {
+                    Label("查状态 / 下单", systemImage: "washer.fill")
+                        .font(.caption.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+                .disabled(laundry.isWorking)
+            }
+        }
+        .padding(14)
+        .glassEffect(
+            device.isKnownIdle ? .regular.tint(.indigo) : .regular,
+            in: .rect(cornerRadius: 22)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(device.isKnownIdle ? Color.green.opacity(0.35) : Color.clear, lineWidth: 1)
+        )
     }
 
     private func quickScanCard(hasActiveOrder: Bool) -> some View {

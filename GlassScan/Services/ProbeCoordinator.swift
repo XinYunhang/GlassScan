@@ -140,7 +140,7 @@ final class ProbeCoordinator {
             results.append(httpEntry)
         }
 
-        // 2. Ujing probe if Ujing token exists and code looks like Ujing / Alipay / unknown
+        // 2. Ujing probe if Ujing token exists and code looks like Ujing / Alipay / unknown (skip Puwise drinking water)
         let ujingToken = KeychainStore.read(.ujingToken)
         if autoUjingProbe, !ujingToken.isEmpty {
             let shouldTryUjing = (platform == .ujing || platform == .alipay || platform == .web || platform == .text)
@@ -148,6 +148,21 @@ final class ProbeCoordinator {
                 let ujingEntries = await UjingClient.shared.probeQRCode(rawQRCode: rawText, token: ujingToken)
                 results.append(contentsOf: ujingEntries)
             }
+        }
+
+        // 2.5 Puwise (社慧通饮水) local identification
+        if platform == .shehuitong {
+            results.append(
+                ProbeEntry(
+                    probeType: "shehuitong_hint",
+                    title: "社慧通饮水机二维码 (puwise.com)",
+                    method: "LOCAL",
+                    endpoint: rawText,
+                    success: true,
+                    durationMs: 0,
+                    summary: "已识别为社慧通校园饮水机固定码并保存；该平台仅限支付宝/微信「社慧通」小程序扣款，暂不支持独立 HTTP 鉴权。"
+                )
+            )
         }
 
         // 3. Qiekj probe if Qiekj token exists and platform is Pangguai with candidate goodsId

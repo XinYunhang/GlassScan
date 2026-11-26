@@ -4,6 +4,7 @@ import SwiftData
 enum ScanPlatform: String, Codable, CaseIterable, Identifiable, Sendable {
     case pangguai = "pangguai"
     case ujing = "ujing"
+    case shehuitong = "shehuitong"
     case alipay = "alipay"
     case wechat = "wechat"
     case web = "web"
@@ -15,6 +16,7 @@ enum ScanPlatform: String, Codable, CaseIterable, Identifiable, Sendable {
         switch self {
         case .pangguai: return "胖乖生活"
         case .ujing: return "U净"
+        case .shehuitong: return "社慧通饮水"
         case .alipay: return "支付宝"
         case .wechat: return "微信"
         case .web: return "网页链接"
@@ -26,6 +28,7 @@ enum ScanPlatform: String, Codable, CaseIterable, Identifiable, Sendable {
         switch self {
         case .pangguai: return "drop.fill"
         case .ujing: return "washer.fill"
+        case .shehuitong: return "cup.and.saucer.fill"
         case .alipay: return "qrcode.viewfinder"
         case .wechat: return "message.fill"
         case .web: return "globe"

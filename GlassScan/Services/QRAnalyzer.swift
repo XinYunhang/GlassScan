@@ -97,6 +97,9 @@ enum QRAnalyzer {
         if host.contains("ujing") || host.contains("midea") || lower.contains("ujing") || lower.contains("u-clean") {
             return .ujing
         }
+        if host.contains("puwise") || lower.contains("puwise.com") || lower.contains("puwise.cn") {
+            return .shehuitong
+        }
         if host.contains("alipay") || lower.hasPrefix("alipays://") || lower.hasPrefix("alipay://") || lower.contains("qr.alipay.com") {
             // Check nested Alipay mini-program page param for ujing / qiekj hints
             let joined = queryEntries.map { $0.value.lowercased() }.joined(separator: " ")

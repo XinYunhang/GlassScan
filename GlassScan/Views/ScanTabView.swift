@@ -18,6 +18,7 @@ struct ScanTabView: View {
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var latestRecord: ScanRecord?
     @State private var presentingRecord: ScanRecord?
+    @State private var showSavedRecordsSheet = false
     @State private var showManualInput = false
     @State private var manualText = ""
     @State private var toastMessage: String?
@@ -86,6 +87,22 @@ struct ScanTabView: View {
             .presentationDetents([.large, .medium])
             .presentationDragIndicator(.visible)
         }
+        .sheet(isPresented: $showSavedRecordsSheet, onDismiss: {
+            isScanningEnabled = true
+        }) {
+            NavigationStack {
+                RecordsTabView()
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("关闭") {
+                                showSavedRecordsSheet = false
+                            }
+                        }
+                    }
+            }
+            .presentationDetents([.large, .medium])
+            .presentationDragIndicator(.visible)
+        }
         .alert("输入或粘贴二维码原文", isPresented: $showManualInput) {
             TextField("粘贴链接或设备码", text: $manualText)
             Button("取消", role: .cancel) { manualText = "" }
@@ -138,12 +155,26 @@ struct ScanTabView: View {
                 Spacer(minLength: 4)
 
                 Button {
+                    isScanningEnabled = false
+                    showSavedRecordsSheet = true
+                } label: {
+                    Label("\(records.count)", systemImage: "tray.full.fill")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .capsule)
+                .glassEffectID("scan-records-pill", in: glassNS)
+                .accessibilityLabel("已保存的扫码记录")
+
+                Button {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                         businessMode.toggle()
                     }
-                    showToast(businessMode ? "已切回：业务直达模式" : "已切到：纯采样调试模式")
+                    showToast(businessMode ? "已切回：业务直达模式" : "已切到：连续采样 / 仅收录模式")
                 } label: {
-                    Label(businessMode ? "业务" : "采样", systemImage: businessMode ? "bolt.fill" : "waveform.path.ecg")
+                    Label(businessMode ? "业务" : "收录", systemImage: businessMode ? "bolt.fill" : "square.and.arrow.down.fill")
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
@@ -168,9 +199,17 @@ struct ScanTabView: View {
                         .glassEffect(.regular.tint(platformTint(record.platform)), in: .circle)
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(record.displayTitle)
-                            .font(.headline)
-                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            Text(record.displayTitle)
+                                .font(.headline)
+                                .lineLimit(1)
+                            Text("已保存")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.green.opacity(0.2), in: Capsule())
+                                .foregroundStyle(.green)
+                        }
                         Text(record.stabilityHint)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -219,6 +258,17 @@ struct ScanTabView: View {
                         }
                         .buttonStyle(.glassProminent)
                         .tint(.cyan)
+                    } else if record.platform == .shehuitong {
+                        Button {
+                            if let url = URL(string: "alipays://platformapi/startapp?saId=10000007") {
+                                UIApplication.shared.open(url)
+                            }
+                        } label: {
+                            Label("支付宝扫一扫", systemImage: "cup.and.saucer.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(.teal)
                     }
 
                     Button {
@@ -325,9 +375,9 @@ struct ScanTabView: View {
         )
 
         Task {
-            // In business mode, route Ujing washer/dryer directly into the order & payment sheet
+            // In business mode, route Ujing washer/dryer directly into the order & payment sheet (and auto-save fixed QR!)
             if businessMode && analysis.platform == .ujing && laundry.isLoggedIn {
-                showToast("正在识别 U净设备档位…")
+                showToast("正在识别并保存 U净洗衣机…")
                 let openedOrderSheet = await laundry.prepareFromQRCode(rawText)
                 if openedOrderSheet {
                     _ = await coordinator.handleScannedCode(
@@ -340,6 +390,13 @@ struct ScanTabView: View {
                     return
                 } else if let err = laundry.lastError {
                     showToast(err)
+                }
+            }
+
+            // In collect/sampling mode, auto-save Ujing washer QR without popping order sheet so user can scan all washers quickly!
+            if !businessMode && analysis.platform == .ujing && laundry.isLoggedIn {
+                if let saved = await laundry.saveWasherFromQRCode(rawText) {
+                    showToast("已收录洗衣机：\(saved.displayName)（可在洗衣页远程锁机）")
                 }
             }
 
@@ -399,6 +456,7 @@ struct ScanTabView: View {
         switch platform {
         case .pangguai: return .cyan
         case .ujing: return .indigo
+        case .shehuitong: return .teal
         case .alipay: return .blue
         case .wechat: return .green
         case .web: return .orange
