@@ -12,6 +12,8 @@ struct ShowerTabView: View {
     @State private var showForceDismissConfirm = false
     @State private var showManualAdd = false
     @State private var manualGoodsId = ""
+    @State private var dropTargetStallId: String?
+    @State private var reorderHapticCount = 0
 
     @Namespace private var glassNS
 
@@ -672,12 +674,63 @@ struct ShowerTabView: View {
                 .padding(22)
                 .glassEffect(.regular, in: .rect(cornerRadius: 24))
             } else {
+                let visibleIDs = filteredDevices.map(\.goodsId)
+
+                HStack(spacing: 8) {
+                    Label("长按隔间卡片可拖拽调整排序", systemImage: "hand.draw")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if shower.hasCustomOrder {
+                        Button {
+                            withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                                shower.resetCustomOrder()
+                            }
+                            reorderHapticCount += 1
+                        } label: {
+                            Label("恢复默认", systemImage: "arrow.counterclockwise")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .capsule)
+                    }
+                }
+
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                     ForEach(filteredDevices) { device in
                         stallGridCard(device: device)
                             .id(device.goodsId)
+                            .draggable(device.goodsId) {
+                                stallDragPreview(device: device)
+                            }
+                            .dropDestination(for: String.self) { items, _ in
+                                dropTargetStallId = nil
+                                guard let draggedId = items.first, draggedId != device.goodsId else {
+                                    return false
+                                }
+                                withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                                    shower.moveStall(
+                                        draggedId: draggedId,
+                                        onto: device.goodsId,
+                                        within: visibleIDs
+                                    )
+                                }
+                                reorderHapticCount += 1
+                                return true
+                            } isTargeted: { targeted in
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    if targeted {
+                                        dropTargetStallId = device.goodsId
+                                    } else if dropTargetStallId == device.goodsId {
+                                        dropTargetStallId = nil
+                                    }
+                                }
+                            }
                     }
                 }
+                .sensoryFeedback(.impact(weight: .light), trigger: reorderHapticCount)
             }
         }
     }
@@ -685,6 +738,7 @@ struct ShowerTabView: View {
     private func stallGridCard(device: QiekjDevice) -> some View {
         let isFav = shower.favoriteGoodsIDs.contains(device.goodsId)
         let isHighlighted = shower.highlightedDevice?.goodsId == device.goodsId
+        let isDropTarget = dropTargetStallId == device.goodsId
 
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
@@ -718,6 +772,10 @@ struct ShowerTabView: View {
                         .background(Color.cyan.opacity(0.25), in: Capsule())
                         .foregroundStyle(.cyan)
                 }
+                Spacer(minLength: 0)
+                Image(systemName: "line.3.horizontal")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
 
             if device.isIdle {
@@ -747,16 +805,34 @@ struct ShowerTabView: View {
         }
         .padding(14)
         .glassEffect(
-            isHighlighted ? .regular.tint(.cyan) : (device.isBusy ? .regular.tint(.orange) : .regular),
+            (isHighlighted || isDropTarget) ? .regular.tint(.cyan) : (device.isBusy ? .regular.tint(.orange) : .regular),
             in: .rect(cornerRadius: 22)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .strokeBorder(
-                    isHighlighted ? Color.cyan.opacity(0.75) : (device.isIdle ? Color.green.opacity(0.25) : Color.clear),
-                    lineWidth: isHighlighted ? 1.8 : 1
+                    isDropTarget ? Color.cyan : (isHighlighted ? Color.cyan.opacity(0.75) : (device.isIdle ? Color.green.opacity(0.25) : Color.clear)),
+                    lineWidth: isDropTarget ? 2.2 : (isHighlighted ? 1.8 : 1)
                 )
         )
+        .scaleEffect(isDropTarget ? 1.03 : 1.0)
+    }
+
+    private func stallDragPreview(device: QiekjDevice) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "drop.fill")
+                .foregroundStyle(.cyan)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(device.shortStallTitle)
+                    .font(.subheadline.weight(.bold))
+                Text(device.goodsName)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .glassEffect(.regular.tint(.cyan), in: .rect(cornerRadius: 16))
     }
 
     private func statusBadge(for device: QiekjDevice) -> some View {

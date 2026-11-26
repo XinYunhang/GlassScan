@@ -143,6 +143,22 @@ final class LaundryController {
     @discardableResult
     func upsertSavedDevice(scanInfo: UjingScanInfo, programInfo: UjingProgramInfo?) -> SavedUjingDevice {
         let existing = savedDevices.first(where: { $0.deviceId == scanInfo.deviceId })
+        let remainSec: Int? = scanInfo.createOrderEnabled ? nil : (scanInfo.remainSeconds ?? existing?.estimatedRemainSeconds)
+        let finishAt: Date? = {
+            if scanInfo.createOrderEnabled { return nil }
+            if let direct = scanInfo.remainSeconds, direct > 0 {
+                return Date().addingTimeInterval(Double(direct))
+            }
+            return existing?.estimatedFinishAt
+        }()
+        let source: String? = {
+            if scanInfo.createOrderEnabled { return nil }
+            if let direct = scanInfo.remainSeconds, direct > 0 {
+                return "设备状态"
+            }
+            return existing?.remainTimeSource
+        }()
+
         let updated = SavedUjingDevice(
             deviceId: scanInfo.deviceId,
             rawQRCode: scanInfo.rawQRCode,
@@ -157,7 +173,11 @@ final class LaundryController {
             lastCreateOrderEnabled: scanInfo.createOrderEnabled,
             lastStatus: scanInfo.status,
             lastReason: scanInfo.reason,
-            lastCheckedAt: Date()
+            lastCheckedAt: Date(),
+            lastOrderId: scanInfo.createOrderEnabled ? nil : (scanInfo.orderId.isEmpty ? existing?.lastOrderId : scanInfo.orderId),
+            estimatedRemainSeconds: remainSec,
+            estimatedFinishAt: finishAt,
+            remainTimeSource: source
         )
         if let idx = savedDevices.firstIndex(where: { $0.deviceId == updated.deviceId }) {
             savedDevices[idx] = updated
@@ -196,28 +216,208 @@ final class LaundryController {
         isRefreshingSavedDevices = true
         defer { isRefreshingSavedDevices = false }
 
+        let runningOrders = await UjingClient.shared.fetchRunningOrders(token: token)
+        var storeWaitCache: [String: Int?] = [:]
         var idleCount = 0
+        var detailNotes: [String] = []
         let snapshot = savedDevices
+
         for dev in snapshot {
-            if let scanInfo = try? await UjingClient.shared.scanWasher(token: token, qrCode: dev.rawQRCode),
-               !scanInfo.deviceId.isEmpty {
-                var updated = dev
-                updated.lastCreateOrderEnabled = scanInfo.createOrderEnabled
-                updated.lastStatus = scanInfo.status
-                updated.lastReason = scanInfo.reason
-                updated.lastCheckedAt = Date()
-                if scanInfo.moduleType >= 0 { updated.moduleType = scanInfo.moduleType }
-                if let idx = savedDevices.firstIndex(where: { $0.deviceId == dev.deviceId }) {
-                    savedDevices[idx] = updated
+            if let updated = await refreshSingleSavedDevice(
+                token: token,
+                device: dev,
+                runningOrders: runningOrders,
+                storeWaitCache: &storeWaitCache
+            ) {
+                if updated.isKnownIdle {
+                    idleCount += 1
+                    detailNotes.append("\(updated.displayName): 空闲")
+                } else if let rem = updated.estimatedRemainSeconds, rem > 0 {
+                    let mins = max(1, (rem + 59) / 60)
+                    detailNotes.append("\(updated.displayName): 使用中约剩\(mins)分(\(updated.remainTimeSource ?? ""))")
+                } else {
+                    detailNotes.append("\(updated.displayName): \(updated.statusBadgeText)(未公开剩余时长)")
                 }
-                if scanInfo.createOrderEnabled { idleCount += 1 }
             }
         }
-        AppLog.shared.record(.info, module: .laundry, "已刷新 \(snapshot.count) 台常驻洗衣机状态：空闲 \(idleCount) 台")
+        AppLog.shared.record(
+            .info,
+            module: .laundry,
+            "已刷新 \(snapshot.count) 台常驻洗衣机状态：空闲 \(idleCount) 台",
+            detail: detailNotes.joined(separator: "\n")
+        )
+    }
+
+    func refreshSavedDeviceStatus(id: String) async {
+        let token = KeychainStore.read(.ujingToken)
+        guard !token.isEmpty,
+              let dev = savedDevices.first(where: { $0.deviceId == id }),
+              !isRefreshingSavedDevices else { return }
+
+        isRefreshingSavedDevices = true
+        defer { isRefreshingSavedDevices = false }
+
+        let runningOrders = await UjingClient.shared.fetchRunningOrders(token: token)
+        var storeWaitCache: [String: Int?] = [:]
+        if let updated = await refreshSingleSavedDevice(
+            token: token,
+            device: dev,
+            runningOrders: runningOrders,
+            storeWaitCache: &storeWaitCache
+        ) {
+            if updated.isKnownIdle {
+                noticeText = "\(updated.displayName) 当前空闲，可立即远程锁机下单"
+            } else if let rem = updated.estimatedRemainSeconds, rem > 0 {
+                let mins = max(1, (rem + 59) / 60)
+                noticeText = "\(updated.displayName) 使用中，预计还剩约 \(mins) 分钟（\(updated.remainTimeSource ?? "估算")）"
+            } else {
+                noticeText = "\(updated.displayName) 使用中，U净服务端暂未公开他人订单的剩余时长"
+            }
+        }
+    }
+
+    private func refreshSingleSavedDevice(
+        token: String,
+        device: SavedUjingDevice,
+        runningOrders: [(orderId: String, deviceId: String, remainSeconds: Int, status: String)],
+        storeWaitCache: inout [String: Int?]
+    ) async -> SavedUjingDevice? {
+        guard let scanInfo = try? await UjingClient.shared.scanWasher(token: token, qrCode: device.rawQRCode),
+              !scanInfo.deviceId.isEmpty else {
+            return nil
+        }
+
+        var updated = device
+        updated.lastCreateOrderEnabled = scanInfo.createOrderEnabled
+        updated.lastStatus = scanInfo.status
+        updated.lastReason = scanInfo.reason
+        updated.lastCheckedAt = Date()
+        if scanInfo.moduleType >= 0 { updated.moduleType = scanInfo.moduleType }
+
+        if scanInfo.createOrderEnabled {
+            updated.lastOrderId = nil
+            updated.estimatedRemainSeconds = nil
+            updated.estimatedFinishAt = nil
+            updated.remainTimeSource = nil
+        } else {
+            updated.lastOrderId = scanInfo.orderId.isEmpty ? nil : scanInfo.orderId
+            if let probed = await probeBusyRemainingTime(
+                token: token,
+                device: updated,
+                scanInfo: scanInfo,
+                runningOrders: runningOrders,
+                storeWaitCache: &storeWaitCache
+            ) {
+                updated.estimatedRemainSeconds = probed.seconds
+                updated.estimatedFinishAt = Date().addingTimeInterval(Double(probed.seconds))
+                updated.remainTimeSource = probed.source
+            } else {
+                updated.estimatedRemainSeconds = nil
+                updated.estimatedFinishAt = nil
+                updated.remainTimeSource = nil
+            }
+        }
+
+        if let idx = savedDevices.firstIndex(where: { $0.deviceId == device.deviceId }) {
+            savedDevices[idx] = updated
+        }
+        return updated
+    }
+
+    private func probeBusyRemainingTime(
+        token: String,
+        device: SavedUjingDevice,
+        scanInfo: UjingScanInfo,
+        runningOrders: [(orderId: String, deviceId: String, remainSeconds: Int, status: String)],
+        storeWaitCache: inout [String: Int?]
+    ) async -> (seconds: Int, source: String)? {
+        // 1. User's own locally tracked active order
+        if let active = activeOrder, !active.isTerminal, active.deviceId == device.deviceId {
+            let elapsed = max(0, Int(Date().timeIntervalSince(active.lastSyncedAt)))
+            let live = active.remainSeconds - (active.status == "40" ? elapsed : 0)
+            if live > 0 {
+                return (live, "本人订单")
+            }
+        }
+
+        // 2. User's running orders returned by `/orders/running`
+        if let running = runningOrders.first(where: { $0.deviceId == device.deviceId && $0.remainSeconds > 0 }) {
+            return (running.remainSeconds, "本人订单")
+        }
+
+        // 3. Direct remainTime returned by `scanWasherCode`
+        if let direct = scanInfo.remainSeconds, direct > 0 {
+            return (direct, "设备状态")
+        }
+
+        // 4. Best-effort query of `orderId` returned in `scanWasherCode` (if server permits)
+        if !scanInfo.orderId.isEmpty,
+           let detail = try? await UjingClient.shared.fetchOrderDetail(token: token, orderId: scanInfo.orderId, existing: nil),
+           detail.remainSeconds > 0 {
+            return (detail.remainSeconds, "当前订单")
+        }
+
+        // 5. Best-effort probe of `GET /devices/{deviceId}`
+        if let devRemain = await UjingClient.shared.fetchDeviceRemainingSeconds(token: token, deviceId: device.deviceId),
+           devRemain > 0 {
+            return (devRemain, "设备详情")
+        }
+
+        // 6. Parse minutes embedded in `reason` text (e.g. "预计还需18分钟")
+        if let parsedMins = parseMinutesFromText(scanInfo.reason), parsedMins > 0 {
+            return (parsedMins * 60, "设备提示")
+        }
+
+        // 7. Store-level estimated wait time (`GET /app/washer/store/waitTime`), cached per store+type
+        if !device.storeId.isEmpty {
+            let cacheKey = "\(device.storeId)_\(device.deviceTypeId)"
+            let waitMins: Int?
+            if let cached = storeWaitCache[cacheKey] {
+                waitMins = cached
+            } else {
+                let fetched = await UjingClient.shared.fetchStoreWaitMinutes(
+                    token: token,
+                    storeId: device.storeId,
+                    deviceTypeId: device.deviceTypeId
+                )
+                storeWaitCache[cacheKey] = fetched
+                waitMins = fetched
+            }
+            if let waitMins, waitMins > 0 {
+                return (waitMins * 60, "门店预计")
+            }
+        }
+
+        return nil
+    }
+
+    private func parseMinutesFromText(_ text: String) -> Int? {
+        guard !text.isEmpty,
+              let regex = try? NSRegularExpression(pattern: #"(\d{1,3})\s*分"#) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              let numRange = Range(match.range(at: 1), in: text),
+              let mins = Int(text[numRange]),
+              mins > 0 && mins <= 240 else {
+            return nil
+        }
+        return mins
     }
 
     func prepareFromSavedDevice(_ device: SavedUjingDevice) async -> Bool {
         await prepareFromQRCode(device.rawQRCode)
+    }
+
+    func moveSavedDevice(draggedId: String, onto targetId: String) {
+        guard draggedId != targetId,
+              let fromIdx = savedDevices.firstIndex(where: { $0.deviceId == draggedId }),
+              let toIdx = savedDevices.firstIndex(where: { $0.deviceId == targetId }) else {
+            return
+        }
+        let item = savedDevices.remove(at: fromIdx)
+        savedDevices.insert(item, at: toIdx)
     }
 
     func renameSavedDevice(id: String, alias: String) {
@@ -235,7 +435,8 @@ final class LaundryController {
         let existingQRs = Set(savedDevices.map(\.rawQRCode))
         let uniqueCandidates = Array(Set(rawTexts)).filter { raw in
             let lower = raw.lowercased()
-            return (lower.contains("ujing") || lower.contains("midea")) && !existingQRs.contains(raw)
+            let isHairdryer = lower.contains("/6d/") || lower.contains("cd=00006d")
+            return !isHairdryer && (lower.contains("ujing") || lower.contains("midea")) && !existingQRs.contains(raw)
         }
         var imported = 0
         for raw in uniqueCandidates {

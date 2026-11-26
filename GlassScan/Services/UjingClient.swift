@@ -86,6 +86,9 @@ actor UjingClient {
 
         let data = result.jsonObject?["data"] as? [String: Any] ?? [:]
         let inner = (data["result"] as? [String: Any]) ?? data
+        let rawOrderId = stringValue(inner["orderId"]) ?? ""
+        let cleanOrderId = (rawOrderId == "0" || rawOrderId.isEmpty) ? "" : rawOrderId
+        let rawRemain = intValue(inner["remainTime"]) ?? intValue(inner["waitTime"]).map { $0 * 60 }
         return UjingScanInfo(
             rawQRCode: qrCode,
             deviceId: stringValue(inner["deviceId"]) ?? "",
@@ -93,8 +96,122 @@ actor UjingClient {
             moduleType: intValue(inner["moduleType"]) ?? -1,
             createOrderEnabled: boolValue(inner["createOrderEnabled"]) ?? false,
             status: stringValue(inner["status"]) ?? "",
-            reason: stringValue(inner["reason"]) ?? ""
+            reason: stringValue(inner["reason"]) ?? "",
+            orderId: cleanOrderId,
+            remainSeconds: (rawRemain ?? 0) > 0 ? rawRemain : nil
         )
+    }
+
+    /// Resolves `/6d/` Ujing hairdryer QR codes into the official Alipay mini-program launch URL.
+    func resolveHairdryerAlipayURL(qrCode: String) async -> String {
+        let fallbackEncoded = qrCode.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? qrCode
+        let fallbackDoubleEncoded = fallbackEncoded.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? fallbackEncoded
+        let fallbackURL = "alipays://platformapi/startapp?appId=2021002174638299&page=pages/home/home&query=qrCode%3D\(fallbackDoubleEncoded)"
+
+        guard let url = URL(string: "https://phoenix.ujing.online:4443/api/v1/config/getConfigUrlByQrCodeV2") else {
+            return fallbackURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "env": "alipay",
+            "qrCode": qrCode
+        ])
+        do {
+            let (data, _) = try await session.data(for: request)
+            if let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               intValue(json["code"]) == 0,
+               let target = json["data"] as? String,
+               target.hasPrefix("alipays://") {
+                AppLog.log(.net, module: .laundry, "POST /config/getConfigUrlByQrCodeV2 → 吹风机直达支付宝小程序", detail: target)
+                return target
+            }
+        } catch {
+            AppLog.log(.warn, module: .laundry, "获取吹风机直达路由失败，使用内置兜底链接：\(error.localizedDescription)")
+        }
+        return fallbackURL
+    }
+
+    /// Best-effort read of `GET /orders/running` to recover active user orders and exact remaining time.
+    func fetchRunningOrders(token: String) async -> [(orderId: String, deviceId: String, remainSeconds: Int, status: String)] {
+        let result = await performRequest(
+            probeType: "ujing_running_orders",
+            title: "U净进行中订单",
+            method: "GET",
+            path: "orders/running",
+            identity: .business,
+            token: token,
+            query: [],
+            jsonBody: nil
+        )
+        guard result.entry.success else { return [] }
+        let rawList: [[String: Any]]
+        if let arr = result.jsonObject?["data"] as? [[String: Any]] {
+            rawList = arr
+        } else if let dict = result.jsonObject?["data"] as? [String: Any],
+                  let arr = dict["list"] as? [[String: Any]] ?? dict["orders"] as? [[String: Any]] {
+            rawList = arr
+        } else {
+            rawList = []
+        }
+        return rawList.compactMap { item in
+            guard let orderId = stringValue(item["orderId"]) ?? stringValue(item["id"]), !orderId.isEmpty else { return nil }
+            let deviceId = stringValue(item["deviceId"]) ?? ""
+            let remain = intValue(item["remainTime"]) ?? 0
+            let status = stringValue(item["status"]) ?? ""
+            return (orderId, deviceId, remain, status)
+        }
+    }
+
+    /// Best-effort probe of `GET /devices/{deviceId}` to see if remaining time of an occupied washer is exposed.
+    func fetchDeviceRemainingSeconds(token: String, deviceId: String) async -> Int? {
+        guard !deviceId.isEmpty else { return nil }
+        let result = await performRequest(
+            probeType: "ujing_device_detail",
+            title: "U净设备详情探测",
+            method: "GET",
+            path: "devices/\(deviceId)",
+            identity: .business,
+            token: token,
+            query: [],
+            jsonBody: nil
+        )
+        guard result.entry.success, let data = result.jsonObject?["data"] as? [String: Any] else { return nil }
+        if let remainSec = intValue(data["remainTime"]), remainSec > 0 {
+            return remainSec
+        }
+        if let remainMin = intValue(data["waitTime"]) ?? intValue(data["leftTime"]), remainMin > 0 {
+            return remainMin > 120 ? remainMin : remainMin * 60
+        }
+        return nil
+    }
+
+    /// Best-effort query of `GET /app/washer/store/waitTime` for store-level estimated waiting minutes.
+    func fetchStoreWaitMinutes(token: String, storeId: String, deviceTypeId: Int) async -> Int? {
+        guard !storeId.isEmpty else { return nil }
+        let result = await performRequest(
+            probeType: "ujing_store_wait",
+            title: "U净门店预计等待时长",
+            method: "GET",
+            path: "app/washer/store/waitTime",
+            identity: .business,
+            token: token,
+            query: [
+                ("storeId", storeId),
+                ("deviceTypeId", String(max(1, deviceTypeId)))
+            ],
+            jsonBody: nil
+        )
+        guard result.entry.success else { return nil }
+        if let direct = intValue(result.jsonObject?["data"]), direct > 0 {
+            return direct
+        }
+        if let data = result.jsonObject?["data"] as? [String: Any] {
+            let mins = intValue(data["waitTime"]) ?? intValue(data["minWaitTime"]) ?? intValue(data["time"]) ?? 0
+            if mins > 0 { return mins }
+        }
+        return nil
     }
 
     func fetchProgramInfo(token: String, deviceId: String) async throws -> UjingProgramInfo {

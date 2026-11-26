@@ -95,6 +95,9 @@ enum QRAnalyzer {
             return .pangguai
         }
         if host.contains("ujing") || host.contains("midea") || lower.contains("ujing") || lower.contains("u-clean") {
+            if lower.contains("/6d/") || lower.contains("cd=00006d") {
+                return .ujingHairdryer
+            }
             return .ujing
         }
         if host.contains("puwise") || lower.contains("puwise.com") || lower.contains("puwise.cn") {

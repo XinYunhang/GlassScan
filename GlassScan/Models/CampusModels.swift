@@ -206,6 +206,8 @@ struct UjingScanInfo: Equatable, Sendable {
     let createOrderEnabled: Bool
     let status: String
     let reason: String
+    var orderId: String = ""
+    var remainSeconds: Int? = nil
 
     var isCloudStart: Bool {
         moduleType != 1 && moduleType != 5
@@ -397,6 +399,10 @@ struct SavedUjingDevice: Codable, Equatable, Identifiable, Sendable {
     var lastStatus: String
     var lastReason: String
     var lastCheckedAt: Date?
+    var lastOrderId: String? = nil
+    var estimatedRemainSeconds: Int? = nil
+    var estimatedFinishAt: Date? = nil
+    var remainTimeSource: String? = nil
 
     var id: String { deviceId }
 
@@ -430,6 +436,19 @@ struct SavedUjingDevice: Codable, Equatable, Identifiable, Sendable {
 
     var isKnownIdle: Bool { lastCreateOrderEnabled == true }
     var isKnownBusy: Bool { lastCreateOrderEnabled == false }
+
+    func liveRemainingSeconds(at now: Date) -> Int? {
+        guard isKnownBusy, let finishAt = estimatedFinishAt else { return nil }
+        let remaining = Int(finishAt.timeIntervalSince(now))
+        return remaining > 0 ? remaining : nil
+    }
+
+    func estimatedFinishClockText(at now: Date) -> String? {
+        guard isKnownBusy, let finishAt = estimatedFinishAt, finishAt > now else { return nil }
+        let comps = Calendar.current.dateComponents([.hour, .minute], from: finishAt)
+        guard let h = comps.hour, let m = comps.minute else { return nil }
+        return String(format: "%02d:%02d", h, m)
+    }
 }
 
 enum PriceFormatter {

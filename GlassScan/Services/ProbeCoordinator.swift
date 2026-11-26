@@ -35,7 +35,8 @@ final class ProbeCoordinator {
         symbology: String,
         source: ScanSource,
         context: ModelContext,
-        existingRecords: [ScanRecord]
+        existingRecords: [ScanRecord],
+        skipAutoProbes: Bool = false
     ) async -> ScanRecord {
         let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         isProbing = true
@@ -61,6 +62,11 @@ final class ProbeCoordinator {
         )
         context.insert(record)
         try? context.save()
+
+        if skipAutoProbes {
+            statusBanner = "已保存原始扫码数据"
+            return record
+        }
 
         let probes = await runProbes(
             rawText: trimmed,
@@ -150,8 +156,22 @@ final class ProbeCoordinator {
             }
         }
 
-        // 2.5 Puwise (社慧通饮水) local identification
-        if platform == .shehuitong {
+        // 2.5 Ujing Hairdryer (/6d/) Alipay mini-program route & Puwise (社慧通饮水) local identification
+        if platform == .ujingHairdryer {
+            let launchURL = await UjingClient.shared.resolveHairdryerAlipayURL(qrCode: rawText)
+            results.append(
+                ProbeEntry(
+                    probeType: "ujing_hairdryer_route",
+                    title: "U净吹风机直达路由 (/6d/)",
+                    method: "POST",
+                    endpoint: "https://phoenix.ujing.online:4443/api/v1/config/getConfigUrlByQrCodeV2",
+                    success: true,
+                    durationMs: 0,
+                    summary: "已识别为 U净吹风机并解析支付宝小程序直达链接",
+                    rawBody: launchURL
+                )
+            )
+        } else if platform == .shehuitong {
             results.append(
                 ProbeEntry(
                     probeType: "shehuitong_hint",

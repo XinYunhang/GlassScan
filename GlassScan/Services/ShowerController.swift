@@ -16,6 +16,7 @@ final class ShowerController {
     var devices: [QiekjDevice] = []
     var recentOrders: [QiekjOrderSummary] = []
     var favoriteGoodsIDs: Set<String> = []
+    var customOrderIDs: [String] = []
     var usePoints: Bool {
         didSet { UserDefaults.standard.set(usePoints, forKey: "qiekj_use_points") }
     }
@@ -59,6 +60,7 @@ final class ShowerController {
     private var stopRequested = false
 
     private static let favoritesKey = "qiekj_favorite_goods_ids"
+    private static let customOrderKey = "qiekj_custom_stall_order_v1"
     private static let cachedDevicesKey = "qiekj_cached_devices_v1"
     private static let activeSnapshotKey = "qiekj_active_shower_v1"
     private static let selectedBuildingKey = "qiekj_selected_building_v1"
@@ -73,6 +75,9 @@ final class ShowerController {
         self.usePoints = UserDefaults.standard.object(forKey: "qiekj_use_points") as? Bool ?? true
         if let savedFavs = UserDefaults.standard.stringArray(forKey: Self.favoritesKey) {
             self.favoriteGoodsIDs = Set(savedFavs)
+        }
+        if let savedOrder = UserDefaults.standard.stringArray(forKey: Self.customOrderKey) {
+            self.customOrderIDs = savedOrder
         }
         if let data = UserDefaults.standard.data(forKey: Self.cachedDevicesKey),
            let cached = try? JSONDecoder().decode([QiekjDevice].self, from: data) {
@@ -158,12 +163,47 @@ final class ShowerController {
         return Array(Set(filtered.compactMap(\.floorNumber))).sorted()
     }
 
+    var hasCustomOrder: Bool {
+        !customOrderIDs.isEmpty
+    }
+
+    func moveStall(draggedId: String, onto targetId: String, within visibleIDs: [String]) {
+        guard draggedId != targetId else { return }
+        var order = customOrderIDs
+        for id in visibleIDs where !order.contains(id) {
+            order.append(id)
+        }
+        guard let fromIndex = order.firstIndex(of: draggedId),
+              let toIndex = order.firstIndex(of: targetId) else {
+            return
+        }
+        let moved = order.remove(at: fromIndex)
+        order.insert(moved, at: toIndex)
+        customOrderIDs = order
+        UserDefaults.standard.set(order, forKey: Self.customOrderKey)
+    }
+
+    func resetCustomOrder() {
+        customOrderIDs = []
+        UserDefaults.standard.removeObject(forKey: Self.customOrderKey)
+    }
+
     var sortedDevices: [QiekjDevice] {
-        devices.sorted { a, b in
-            if highlightedDevice?.goodsId == a.goodsId { return true }
-            if highlightedDevice?.goodsId == b.goodsId { return false }
-            let favA = favoriteGoodsIDs.contains(a.goodsId)
-            let favB = favoriteGoodsIDs.contains(b.goodsId)
+        let highlightedId = highlightedDevice?.goodsId
+        let orderMap = Dictionary(uniqueKeysWithValues: customOrderIDs.enumerated().map { ($1, $0) })
+        let favs = favoriteGoodsIDs
+        return devices.sorted { a, b in
+            if highlightedId == a.goodsId { return true }
+            if highlightedId == b.goodsId { return false }
+            let customA = orderMap[a.goodsId]
+            let customB = orderMap[b.goodsId]
+            if let ca = customA, let cb = customB, ca != cb {
+                return ca < cb
+            }
+            if customA != nil && customB == nil { return true }
+            if customA == nil && customB != nil { return false }
+            let favA = favs.contains(a.goodsId)
+            let favB = favs.contains(b.goodsId)
             if favA != favB { return favA }
             if a.buildingSortOrder != b.buildingSortOrder { return a.buildingSortOrder < b.buildingSortOrder }
             if let fa = a.floorNumber, let fb = b.floorNumber, fa != fb { return fa < fb }

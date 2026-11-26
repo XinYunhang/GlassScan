@@ -258,6 +258,22 @@ struct ScanTabView: View {
                         }
                         .buttonStyle(.glassProminent)
                         .tint(.cyan)
+                    } else if record.platform == .ujingHairdryer {
+                        Button {
+                            Task {
+                                let target = await UjingClient.shared.resolveHairdryerAlipayURL(qrCode: record.rawText)
+                                if let url = URL(string: target) {
+                                    await MainActor.run {
+                                        UIApplication.shared.open(url)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label("支付宝启动吹风机", systemImage: "wind")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(.purple)
                     } else if record.platform == .shehuitong {
                         Button {
                             if let url = URL(string: "alipays://platformapi/startapp?saId=10000007") {
@@ -375,6 +391,25 @@ struct ScanTabView: View {
         )
 
         Task {
+            // In business mode, route Ujing hairdryer (/6d/) straight to official Alipay mini-program!
+            if businessMode && analysis.platform == .ujingHairdryer {
+                showToast("已识别 U净吹风机，正在拉起支付宝小程序…")
+                _ = await coordinator.handleScannedCode(
+                    rawText: rawText,
+                    symbology: symbology,
+                    source: source,
+                    context: modelContext,
+                    existingRecords: records,
+                    skipAutoProbes: true
+                )
+                let launchURL = await UjingClient.shared.resolveHairdryerAlipayURL(qrCode: rawText)
+                if let url = URL(string: launchURL) {
+                    UIApplication.shared.open(url)
+                }
+                isScanningEnabled = true
+                return
+            }
+
             // In business mode, route Ujing washer/dryer directly into the order & payment sheet (and auto-save fixed QR!)
             if businessMode && analysis.platform == .ujing && laundry.isLoggedIn {
                 showToast("正在识别并保存 U净洗衣机…")
@@ -385,7 +420,8 @@ struct ScanTabView: View {
                         symbology: symbology,
                         source: source,
                         context: modelContext,
-                        existingRecords: records
+                        existingRecords: records,
+                        skipAutoProbes: true
                     )
                     return
                 } else if let err = laundry.lastError {
@@ -414,7 +450,8 @@ struct ScanTabView: View {
                     symbology: symbology,
                     source: source,
                     context: modelContext,
-                    existingRecords: records
+                    existingRecords: records,
+                    skipAutoProbes: true
                 )
                 latestRecord = nil
                 isScanningEnabled = true
@@ -456,6 +493,7 @@ struct ScanTabView: View {
         switch platform {
         case .pangguai: return .cyan
         case .ujing: return .indigo
+        case .ujingHairdryer: return .purple
         case .shehuitong: return .teal
         case .alipay: return .blue
         case .wechat: return .green
