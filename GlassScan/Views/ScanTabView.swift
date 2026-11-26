@@ -263,9 +263,7 @@ struct ScanTabView: View {
                             Task {
                                 let target = await UjingClient.shared.resolveHairdryerAlipayURL(qrCode: record.rawText)
                                 if let url = URL(string: target) {
-                                    await MainActor.run {
-                                        UIApplication.shared.open(url)
-                                    }
+                                    _ = await UIApplication.shared.open(url)
                                 }
                             }
                         } label: {
@@ -404,7 +402,7 @@ struct ScanTabView: View {
                 )
                 let launchURL = await UjingClient.shared.resolveHairdryerAlipayURL(qrCode: rawText)
                 if let url = URL(string: launchURL) {
-                    UIApplication.shared.open(url)
+                    _ = await UIApplication.shared.open(url)
                 }
                 isScanningEnabled = true
                 return
