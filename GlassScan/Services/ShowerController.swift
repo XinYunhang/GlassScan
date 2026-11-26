@@ -173,6 +173,7 @@ final class ShowerController {
     }
 
     func refreshAll() async {
+        guard !isRefreshing else { return }
         let token = KeychainStore.read(.qiekjToken)
         guard !token.isEmpty else {
             balance = nil
@@ -247,14 +248,14 @@ final class ShowerController {
                 token: token,
                 shopId: shopId,
                 machineTypeId: "08",
-                orgId: orgId
+                orgId: "0"
             )) ?? []
             if nearList.isEmpty && orgId != "0" {
                 nearList = (try? await QiekjClient.shared.fetchNearMachines(
                     token: token,
                     shopId: shopId,
                     machineTypeId: "08",
-                    orgId: "0"
+                    orgId: orgId
                 )) ?? []
             }
             nearCount = nearList.count
