@@ -353,14 +353,17 @@ final class ShowerController {
         if devices.isEmpty {
             await refreshAll()
         }
+        let targetBuilding = selectedBuilding
+        let targetFloor = selectedFloor
+        let favs = favoriteGoodsIDs
         let prioritizedCandidates = devices
             .filter { $0.imei == nil || $0.imei?.isEmpty == true }
             .sorted { a, b in
                 func score(_ d: QiekjDevice) -> Int {
                     var s = 0
-                    if let sb = selectedBuilding, d.buildingKey == sb { s += 100 }
-                    if let sf = selectedFloor, d.floorNumber == sf { s += 100 }
-                    if favoriteGoodsIDs.contains(d.goodsId) { s += 20 }
+                    if let sb = targetBuilding, d.buildingKey == sb { s += 100 }
+                    if let sf = targetFloor, d.floorNumber == sf { s += 100 }
+                    if favs.contains(d.goodsId) { s += 20 }
                     return s
                 }
                 let sa = score(a)
